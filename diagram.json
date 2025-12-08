@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "author": "Romultra",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 9.6, "left": -110.36, "attrs": {} },
+    { "type": "wokwi-microsd-card", "id": "sd1", "top": 29.03, "left": 28.87, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "sd1:CS", "esp:2", "green", [ "h19.2", "v86.46" ] ],
+    [ "esp:18", "sd1:SCK", "green", [ "h144", "v-9.6" ] ],
+    [ "sd1:DI", "esp:23", "green", [ "h19.2", "v-76.89", "h-115.2", "v38.4" ] ],
+    [ "esp:19", "sd1:DO", "green", [ "h28.8", "v-86.4", "h96", "v28.69" ] ]
+  ],
+  "dependencies": {}
+}
