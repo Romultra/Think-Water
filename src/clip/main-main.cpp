@@ -32,6 +32,8 @@ const int STABILITY_SAMPLES = 5; // Number of consecutive samples to confirm sta
 // Load Cell Configuration
 HX711 loadcell;
 const float LOADCELL_CALIBRATION_FACTOR = 1.0; // Placeholder - needs calibration
+const float THRESHOLD_DRINK_AMOUNT = 5.0; // Minimum weight change (grams) to register a drink event
+float prevWeight = 0.0;
 
 // BLE Objects
 BLEService coasterService(COASTER_SERVICE_UUID);
@@ -44,6 +46,7 @@ volatile bool dataPendingToSend = false;
 volatile bool shouldAdvertise = false;
 uint32_t lastConsumptionValue = 0;
 float hydrationGoal = 2000.0; // Default 2000ml
+float totalConsumed = 0.0;
 
 // Hysteresis prevents "flickering" events
 // Glass is present if value > 600
@@ -53,17 +56,16 @@ const int THRESHOLD_HIGH = 600;
 const int THRESHOLD_LOW = 500;
 
 // Duty Cycle Intervals
-const int FAST_POLL_MS = 50;   // Check fast when interacting
+const int FAST_POLL_MS = 200;   // Check fast when interacting
 const int SLOW_POLL_MS = 2000; // Check slow when idle (Deep Sleep Duty Cycle)
 
 enum class EventType {
   HEARTBEAT_TICK,
   GLASS_PLACED,
   GLASS_REMOVED,
-  DRINK_DETECTED,
+  CHECK_FOR_DRINK,
   MOTION_DETECTED,
   BLE_COMMAND_RECEIVED,
-  ALERT_TIMEOUT,
   WAKEUP
 };
 
@@ -78,7 +80,6 @@ enum class DeviceState {
   IDLE_NO_GLASS,
   MOVING_WITH_GLASS,
   MOVING_NO_GLASS,
-  ALERTING,
   TEST
 };
 
@@ -86,6 +87,9 @@ DeviceState currentState = DeviceState::TEST;
 
 QueueHandle_t eventQueue;
 TimerHandle_t heartbeatTimer;
+
+TaskHandle_t ledAlertTaskHandle;
+TaskHandle_t ledFeedbackTaskHandle;
 
 void heartbeatCallback(TimerHandle_t xTimer) {
   Event evt;
@@ -398,9 +402,55 @@ bool sendConsumptionEvent(uint32_t timestamp, uint32_t value) {
   }
 }
 
+// TODO: Change To use external neopixel LED instead of built-in LED
+void ledAlertTask(void *pvParameters) {
+  (void)pvParameters;
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  while (1) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for notification
+
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(600));
+      digitalWrite(LED_BUILTIN, LOW);
+      vTaskDelay(pdMS_TO_TICKS(600));
+    }
+  }
+}
+
+void ledFeedbackTask(void *pvParameters) {
+  (void)pvParameters;
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  while (1) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for notification
+
+    // Give feedback on progress towards hydration goal
+    float progress = (totalConsumed / hydrationGoal);
+    // TODO: Change to use external neopixel LED instead of built-in LED
+    int blinkCount = (int)(progress * 10); // Up to 10 blinks
+    blinkCount = constrain(blinkCount, 1, 10);
+    for (int i = 0; i < blinkCount; i++) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(300));
+      digitalWrite(LED_BUILTIN, LOW);
+      vTaskDelay(pdMS_TO_TICKS(300));
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   //while (!Serial) { delay(10); }
+
+  // Configure battery charging current to 100mA
+  pinMode(22, OUTPUT);
+  digitalWrite(22, LOW);
 
   // Create a Queue that can hold 10 events (must exist before ISR runs)
   eventQueue = xQueueCreate(10, sizeof(Event));
@@ -435,6 +485,9 @@ void setup() {
   heartbeatTimer = xTimerCreate("Heartbeat", pdMS_TO_TICKS(SLOW_POLL_MS), pdTRUE, 0, heartbeatCallback);
   xTimerStart(heartbeatTimer, 0);
 
+  xTaskCreate(ledAlertTask, "LED Alert Task", 256, NULL, 1, &ledAlertTaskHandle);
+  xTaskCreate(ledFeedbackTask, "LED Feedback Task", 256, NULL, 1, &ledFeedbackTaskHandle);
+
   Serial.println("Coaster Clip Main Setup");
   delay(500);
 }
@@ -443,6 +496,27 @@ void loop() {
   Event evt;
 
   if (xQueueReceive(eventQueue, &evt, portMAX_DELAY) == pdTRUE) {
+    bool eventConsumed = false;
+    bool glassPresent = false;
+
+    if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
+      uint8_t command = (uint8_t)evt.value;
+      if (command == 0x01) { // LED Alert Request
+        // Notify LED Alert Task
+        xTaskNotifyGive(ledAlertTaskHandle);
+        eventConsumed = true;
+      }
+    }
+
+    if (evt.type == EventType::HEARTBEAT_TICK) {
+      // On heartbeat: check if we have pending data to send
+      if (bleConnected && dataPendingToSend) {
+        sendConsumptionEvent(millis(), lastConsumptionValue);
+      }
+      glassPresent = isGlassPresent();
+    }
+
+    if (!eventConsumed) {
     switch (currentState) {
       case DeviceState::IDLE_WITH_GLASS:
         // Monitor for drinking activity
@@ -452,16 +526,35 @@ void loop() {
         if (evt.type == EventType::MOTION_DETECTED) {
           currentState = DeviceState::MOVING_WITH_GLASS;
           Serial.println("Transition to MOVING_WITH_GLASS");
+          // Switch to a faster heartbear tick for active state
+          xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+
+          // Give feedback on progress towards hydration goal when glass is picked up
+          xTaskNotifyGive(ledFeedbackTaskHandle);
+        }
+
+        else if (evt.type == EventType::CHECK_FOR_DRINK) {
+          // Read weight from load cell
+          float weight = getWeight();
+          if (weight >= 0) {
+            float drinkAmount = prevWeight - weight;
+            if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
+              totalConsumed += drinkAmount;
+              Serial.print("Drink detected: ");
+              Serial.print(drinkAmount);
+              Serial.println(" g");
+
+              // Update previous weight
+              prevWeight = weight;
+
+              // Send consumption event via BLE
+              sendConsumptionEvent(millis(), (uint32_t)drinkAmount);
+            }
+          }
         }
 
         // On heartbeat: check for glass removal and send pending BLE data
-        if (evt.type == EventType::HEARTBEAT_TICK) {
-          // If connected and have pending data, send it
-          if (bleConnected && dataPendingToSend) {
-            sendConsumptionEvent(millis(), lastConsumptionValue);
-          }
-          
-          bool glassPresent = isGlassPresent();
+        else if (evt.type == EventType::HEARTBEAT_TICK) {
           if (!glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
             Serial.println("Transition to IDLE_NO_GLASS");
@@ -470,16 +563,6 @@ void loop() {
             removeEvt.type = EventType::GLASS_REMOVED;
             xQueueSend(eventQueue, &removeEvt, 0);
           }
-        }
-        
-        // Handle BLE commands (LED alerts, status queries, etc.)
-        if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
-          uint8_t command = (uint8_t)evt.value;
-          // Command 0x01 = LED Alert (not implemented yet)
-          // Command 0x02 = Status Query (could send current state)
-          // For now, just acknowledge
-          Serial.print("BLE Command in IDLE_WITH_GLASS: 0x");
-          Serial.println(command, HEX);
         }
 
         break;
@@ -492,16 +575,12 @@ void loop() {
         if (evt.type == EventType::MOTION_DETECTED) {
           currentState = DeviceState::MOVING_NO_GLASS;
           Serial.println("Transition to MOVING_NO_GLASS");
+          // Switch to a faster heartbear tick for active state
+          xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
         }
 
         // On heartbeat: check for glass placement and send pending BLE data
-        if (evt.type == EventType::HEARTBEAT_TICK) {
-          // If connected and have pending data, send it
-          if (bleConnected && dataPendingToSend) {
-            sendConsumptionEvent(millis(), lastConsumptionValue);
-          }
-          
-          bool glassPresent = isGlassPresent();
+        else if (evt.type == EventType::HEARTBEAT_TICK) {
           if (glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
@@ -511,14 +590,6 @@ void loop() {
             xQueueSend(eventQueue, &placeEvt, 0);
           }
         }
-        
-        // Handle BLE commands
-        if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
-          uint8_t command = (uint8_t)evt.value;
-          Serial.print("BLE Command in IDLE_NO_GLASS: 0x");
-          Serial.println(command, HEX);
-        }
-        break;
       
       case DeviceState::MOVING_WITH_GLASS:
         // Handle movement with glass
@@ -526,40 +597,37 @@ void loop() {
 
         // One heartbeat: check accel for upright stable position and for glass removal
         if (evt.type == EventType::HEARTBEAT_TICK) {
+          Event e;
+          bool sendEvent = false;
           bool isStableUpright = isUprightStable();
-          bool glassPresent = isGlassPresent();
 
-          if (isStableUpright) {
-            if (glassPresent) {
-              currentState = DeviceState::IDLE_WITH_GLASS;
-              Serial.println("Transition to IDLE_WITH_GLASS");
-              // Create DRINK_DETECTED event
-              Event drinkEvt;
-              drinkEvt.type = EventType::DRINK_DETECTED;
-              xQueueSend(eventQueue, &drinkEvt, 0);
-              
-              // Send consumption event via BLE
-              float weight = getWeight();
-              if (weight > 0) {
-                uint32_t weightValue = (uint32_t)(weight * 100); // Convert to int (0.01g precision)
-                sendConsumptionEvent(millis(), weightValue);
-              }
-
-            } else {
-              currentState = DeviceState::IDLE_NO_GLASS;
-              Serial.println("Transition to IDLE_NO_GLASS");
-              // Create GLASS_REMOVED event
-              Event removeEvt;
-              removeEvt.type = EventType::GLASS_REMOVED;
-              xQueueSend(eventQueue, &removeEvt, 0);
-            }          
-          } else if (!glassPresent) {
+          if (isStableUpright && glassPresent) {
+            currentState = DeviceState::IDLE_WITH_GLASS;
+            Serial.println("Transition to IDLE_WITH_GLASS");
+            // Switch to a slower heartbear tick for idle state
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+            
+            e.type = EventType::CHECK_FOR_DRINK;
+            sendEvent = true;
+          }
+          else if (isStableUpright && !glassPresent) {
+            currentState = DeviceState::IDLE_NO_GLASS;
+            Serial.println("Transition to IDLE_NO_GLASS");
+            // Switch to a slower heartbear tick for idle state
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+            
+            e.type = EventType::GLASS_REMOVED;
+            sendEvent = true;
+          }          
+          else if (!isStableUpright && !glassPresent) {
             currentState = DeviceState::MOVING_NO_GLASS;
             Serial.println("Transition to MOVING_NO_GLASS");
-            // Create GLASS_REMOVED event
-            Event removeEvt;
-            removeEvt.type = EventType::GLASS_REMOVED;
-            xQueueSend(eventQueue, &removeEvt, 0);
+            
+            e.type = EventType::GLASS_REMOVED;
+            sendEvent = true;
+          }
+          if (sendEvent) {
+            xQueueSend(eventQueue, &e, 0);
           }
         }
         break;
@@ -571,35 +639,36 @@ void loop() {
         // On heartbeat, check accel for any stable position and for glass placement
         if (evt.type == EventType::HEARTBEAT_TICK) {
           bool isDeviceStable = isStable();
-          bool glassNowPresent = isGlassPresent();
-          if (isDeviceStable) {
-            if (glassNowPresent) {
-              currentState = DeviceState::IDLE_WITH_GLASS;
-              Serial.println("Transition to IDLE_WITH_GLASS");
-              // Create GLASS_PLACED event
-              Event placeEvt;
-              placeEvt.type = EventType::GLASS_PLACED;
-              xQueueSend(eventQueue, &placeEvt, 0);
-            } else {
-              currentState = DeviceState::IDLE_NO_GLASS;
-              Serial.println("Transition to IDLE_NO_GLASS");
-              // Only create event when changing glass state
-            }
-          } else if (glassNowPresent) {
+          
+          if (isDeviceStable && glassPresent) {
+            currentState = DeviceState::IDLE_WITH_GLASS;
+            Serial.println("Transition to IDLE_WITH_GLASS");
+            // Switch to a slower heartbear tick for idle state
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+            
+            Event e1;
+            e1.type = EventType::GLASS_PLACED;
+            xQueueSend(eventQueue, &e1, 0);
+            
+            Event e2;
+            e2.type = EventType::CHECK_FOR_DRINK;
+            xQueueSend(eventQueue, &e2, 0);
+          }
+          else if (isDeviceStable && !glassPresent) {
+            currentState = DeviceState::IDLE_NO_GLASS;
+            Serial.println("Transition to IDLE_NO_GLASS");
+            // Switch to a slower heartbear tick for idle state
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+          }
+          else if (!isDeviceStable && glassPresent) {
             currentState = DeviceState::MOVING_WITH_GLASS;
             Serial.println("Transition to MOVING_WITH_GLASS");
-            // Create GLASS_PLACED event
-            Event placeEvt;
-            placeEvt.type = EventType::GLASS_PLACED;
-            xQueueSend(eventQueue, &placeEvt, 0);
+            
+            Event e;
+            e.type = EventType::GLASS_PLACED;
+            xQueueSend(eventQueue, &e, 0);
           }
         }
-        break;
-      
-      case DeviceState::ALERTING:
-        // Alert user if needed
-        Serial.println("State: ALERTING");
-        // Transition logic here
         break;
       
       case DeviceState::TEST:
@@ -679,13 +748,13 @@ void loop() {
           }
         }
 
-        if (evt.type == EventType::MOTION_DETECTED) {
+        else if (evt.type == EventType::MOTION_DETECTED) {
           Serial.println("Motion Detected Event Received");
           clearIMUInterrupt(); // Clear interrupt source
         }
         
         // BLE Test: Handle commands in TEST mode
-        if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
+        else if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
           uint8_t command = (uint8_t)evt.value;
           Serial.println("========================================");
           Serial.print("BLE TEST: Command Received: 0x");
@@ -737,6 +806,7 @@ void loop() {
         }
         break;
     }
+  }
   }
   yield(); // Allow other tasks to run
 } 
