@@ -7,6 +7,10 @@
 #include <Wire.h>
 #include <math.h>
 #include <HX711.h>
+#include <Adafruit_SPIFlash.h>
+
+Adafruit_FlashTransport_QSPI flashTransport;
+Adafruit_SPIFlash flash(&flashTransport);
 
 // BLE Service and Characteristics UUIDs
 #define COASTER_SERVICE_UUID        "19B10010-E8F2-537E-4F6C-D104768A1214"
@@ -25,6 +29,7 @@ LSM6DS3 imu(I2C_MODE, 0x6A); // I2C address for Seeed XIAO nrf52840 Sense
 // NOTE: the IMU returns accelerations in units of g (1g = 9.80665 m/s^2)
 // Convert the previous m/s^2 thresholds into g-units here.
 const float ACCEL_STABILITY_THRESHOLD = 0.051f; // ~0.5 m/s^2 in g (max deviation for stability)
+const float MAGNITUDE_THRESHOLD = ACCEL_STABILITY_THRESHOLD * sqrtf(3.0f);
 const float UPRIGHT_Z_MIN = 0.867f; // ~8.5 m/s^2 in g (minimum Z acceleration for upright)
 const float UPRIGHT_Z_MAX = 1.071f; // ~10.5 m/s^2 in g (maximum Z acceleration for upright)
 const int STABILITY_SAMPLES = 5; // Number of consecutive samples to confirm stability
@@ -45,6 +50,7 @@ bool bleConnected = false;
 volatile bool dataPendingToSend = false;
 volatile bool shouldAdvertise = false;
 uint32_t lastConsumptionValue = 0;
+bool glassChanded = false;
 float hydrationGoal = 2000.0; // Default 2000ml
 float totalConsumed = 0.0;
 
@@ -104,8 +110,8 @@ bool isGlassPresent() {
   } else if (val < THRESHOLD_LOW) {
     return false;
   }
-  // In hysteresis zone, keep previous state
-  static bool lastState = false;
+  // In hysteresis zone, keep previous state. For the inital call, use middle of threshold as a binary state.
+  static bool lastState = (val >= (THRESHOLD_HIGH + THRESHOLD_LOW) / 2);
   return lastState;
 }
 
@@ -123,9 +129,10 @@ float getWeight() {
 
 bool isUprightStable() {
   // Collect multiple samples to check for stability
-  static float lastZ = 0.97f; // Initialize to middle of upright range (g)
-  float sumDeviation = 0;
+  // Initialize previous-sample values from the first reading in this call
+  float sumDeviation = 0.0f;
   bool isStable = true;
+  float lastZ = 0.0f;
 
   for (int i = 0; i < STABILITY_SAMPLES; i++) {
     // Read accelerometer data
@@ -138,12 +145,17 @@ bool isUprightStable() {
       return false; // Not in upright orientation
     }
 
-    // Check for stability: deviation from expected Z value
-    float deviation = abs(accelZ - lastZ);
+    // For the first sample, seed lastZ so we don't compare against stale state
+    if (i == 0) {
+      lastZ = accelZ;
+    }
+
+    // Check for stability: deviation from previous sample within this call
+    float deviation = fabsf(accelZ - lastZ);
     sumDeviation += deviation;
 
     // Check that X and Y are close to zero (minimal lateral acceleration)
-    if (abs(accelX) > ACCEL_STABILITY_THRESHOLD || abs(accelY) > ACCEL_STABILITY_THRESHOLD) {
+    if (fabsf(accelX) > ACCEL_STABILITY_THRESHOLD || fabsf(accelY) > ACCEL_STABILITY_THRESHOLD) {
       isStable = false;
     }
 
@@ -151,9 +163,9 @@ bool isUprightStable() {
     delay(10); // Small delay between samples
   }
 
-  // Average deviation across samples
-  float avgDeviation = sumDeviation / STABILITY_SAMPLES;
-  
+  // Average deviation across samples (first sample contributes 0)
+  float avgDeviation = sumDeviation / (STABILITY_SAMPLES - 1);
+
   return isStable && (avgDeviation < ACCEL_STABILITY_THRESHOLD);
 }
 
@@ -213,11 +225,12 @@ void clearIMUInterrupt() {
 
 bool isStable() {
   // Collect multiple samples to check for stability (any orientation)
-  static float lastX = 0;
-  static float lastY = 0;
-  static float lastZ = 0.97f; // g-units
-  float sumDeviation = 0;
+  // Initialize previous-sample values from the first reading in this call
+  float sumDeviation = 0.0f;
   bool isStable = true;
+  float lastX = 0.0f;
+  float lastY = 0.0f;
+  float lastZ = 0.0f;
 
   for (int i = 0; i < STABILITY_SAMPLES; i++) {
     // Read accelerometer data
@@ -225,16 +238,25 @@ bool isStable() {
     float accelY = imu.readFloatAccelY();
     float accelZ = imu.readFloatAccelZ();
 
-    // Check for stability: deviation from previous values
-    float deviationX = abs(accelX - lastX);
-    float deviationY = abs(accelY - lastY);
-    float deviationZ = abs(accelZ - lastZ);
+    // For the first sample, seed last values so we don't compare against stale state
+    if (i == 0) {
+      lastX = accelX;
+      lastY = accelY;
+      lastZ = accelZ;
+    }
+
+    // Check for stability: deviation from previous values within this call
+    float deviationX = fabsf(accelX - lastX);
+    float deviationY = fabsf(accelY - lastY);
+    float deviationZ = fabsf(accelZ - lastZ);
     sumDeviation += (deviationX + deviationY + deviationZ);
 
-    // Check that all axes have minimal acceleration (low movement)
-    if (abs(accelX) > ACCEL_STABILITY_THRESHOLD || 
-        abs(accelY) > ACCEL_STABILITY_THRESHOLD || 
-        abs(accelZ) > ACCEL_STABILITY_THRESHOLD) {
+    // Check if the magnitude of acceleration deviates from 1g (earth's gravity)
+    // This indicates motion regardless of device orientation
+    float accelMagnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+    float magnitudeDeviation = fabsf(accelMagnitude - 1.0f); // 1.0g is gravity at rest
+
+    if (magnitudeDeviation > MAGNITUDE_THRESHOLD) {
       isStable = false;
     }
 
@@ -244,9 +266,9 @@ bool isStable() {
     delay(10); // Small delay between samples
   }
 
-  // Average deviation across samples
-  float avgDeviation = sumDeviation / (STABILITY_SAMPLES * 3);
-  
+  // Average deviation across samples and axes
+  float avgDeviation = sumDeviation / ((STABILITY_SAMPLES - 1) * 3);
+
   return isStable && (avgDeviation < ACCEL_STABILITY_THRESHOLD);
 }
 
@@ -444,6 +466,43 @@ void ledFeedbackTask(void *pvParameters) {
   }
 }
 
+// Determine initial state based on glass presence and stability
+void determineInitialState() {
+  bool glassPresent = isGlassPresent();
+  bool uprightStable = isUprightStable();
+  bool stable = isStable();
+
+  if (glassPresent && uprightStable) {
+    currentState = DeviceState::IDLE_WITH_GLASS;
+  } else if (!glassPresent && stable) {
+    currentState = DeviceState::IDLE_NO_GLASS;
+  } else if (glassPresent && !stable) {
+    currentState = DeviceState::MOVING_WITH_GLASS;
+  } else {
+    currentState = DeviceState::MOVING_NO_GLASS;
+  }
+
+  Serial.print("Initial State: ");
+  switch (currentState) {
+    case DeviceState::IDLE_WITH_GLASS:
+      Serial.println("IDLE_WITH_GLASS");
+      break;
+    case DeviceState::IDLE_NO_GLASS:
+      Serial.println("IDLE_NO_GLASS");
+      break;
+    case DeviceState::MOVING_WITH_GLASS:
+      Serial.println("MOVING_WITH_GLASS");
+      break;
+    case DeviceState::MOVING_NO_GLASS:
+      Serial.println("MOVING_NO_GLASS");
+      break;
+    default:
+      Serial.println("UNKNOWN");
+      break;
+  }
+}
+
+
 void setup() {
   Serial.begin(115200);
   //while (!Serial) { delay(10); }
@@ -451,6 +510,12 @@ void setup() {
   // Configure battery charging current to 100mA
   pinMode(22, OUTPUT);
   digitalWrite(22, LOW);
+
+  // Initialize SPI Flash and enter deep power-down mode to save power
+  flashTransport.begin();
+  flashTransport.runCommand(0xB9);  // enter deep power-down mode
+  delayMicroseconds(5);             // tDP=3uS
+  flashTransport.end();
 
   // Create a Queue that can hold 10 events (must exist before ISR runs)
   eventQueue = xQueueCreate(10, sizeof(Event));
@@ -469,7 +534,7 @@ void setup() {
     clearIMUInterrupt(); // Clear any pending interrupts
   }
   
-  // Initialize load cell
+  // Initialize load cell TODO: Uncomment when load cell is working
   /*
   loadcell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
   loadcell.set_scale(LOADCELL_CALIBRATION_FACTOR); // Apply calibration factor
@@ -646,13 +711,9 @@ void loop() {
             // Switch to a slower heartbear tick for idle state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
             
-            Event e1;
-            e1.type = EventType::GLASS_PLACED;
-            xQueueSend(eventQueue, &e1, 0);
-            
-            Event e2;
-            e2.type = EventType::CHECK_FOR_DRINK;
-            xQueueSend(eventQueue, &e2, 0);
+            Event e;
+            e.type = EventType::GLASS_PLACED;
+            xQueueSend(eventQueue, &e, 0);
           }
           else if (isDeviceStable && !glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
