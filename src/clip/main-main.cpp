@@ -7,10 +7,9 @@
 #include <Wire.h>
 #include <math.h>
 #include <HX711.h>
-#include <Adafruit_SPIFlash.h>
+#include <Adafruit_FlashTransport.h>
 
 Adafruit_FlashTransport_QSPI flashTransport;
-Adafruit_SPIFlash flash(&flashTransport);
 
 // BLE Service and Characteristics UUIDs
 #define COASTER_SERVICE_UUID        "19B10010-E8F2-537E-4F6C-D104768A1214"
@@ -20,19 +19,71 @@ Adafruit_SPIFlash flash(&flashTransport);
 
 const int HALL_SENSOR_PIN = A0;
 const int IMU_INT1_PIN = PIN_LSM6DS3TR_C_INT1; // LSM6DS3TR-C INT1 pin on XIAO nrf52840 Sense
-const int LOADCELL_DOUT_PIN = 9;
-const int LOADCELL_SCK_PIN = 8;
+const int LOADCELL_DOUT_PIN = D2;
+const int LOADCELL_SCK_PIN = D3;
 
 // Accelerometer Configuration
 LSM6DS3 imu(I2C_MODE, 0x6A); // I2C address for Seeed XIAO nrf52840 Sense
 
 // NOTE: the IMU returns accelerations in units of g (1g = 9.80665 m/s^2)
-// Convert the previous m/s^2 thresholds into g-units here.
-const float ACCEL_STABILITY_THRESHOLD = 0.051f; // ~0.5 m/s^2 in g (max deviation for stability)
-const float MAGNITUDE_THRESHOLD = ACCEL_STABILITY_THRESHOLD * sqrtf(3.0f);
-const float UPRIGHT_Z_MIN = 0.867f; // ~8.5 m/s^2 in g (minimum Z acceleration for upright)
-const float UPRIGHT_Z_MAX = 1.071f; // ~10.5 m/s^2 in g (maximum Z acceleration for upright)
-const int STABILITY_SAMPLES = 5; // Number of consecutive samples to confirm stability
+
+// Stability Detection Configuration
+const int STABILITY_SAMPLES = 10;      // Number of samples to check for stability
+const float ACCEL_DEVIATION_THRESHOLD = 0.05; // Max deviation between samples to consider stable
+const float ACCEL_MAGNITUDE_MIN = 0.95;  // Minimum magnitude for stable (close to 1g)
+const float ACCEL_MAGNITUDE_MAX = 1.1;  // Maximum magnitude for stable (close to 1g)
+
+bool isStableGeneric(bool requireUpright) {
+  if (STABILITY_SAMPLES < 2) return false;
+
+  float sumDelta = 0.0f;
+  bool okMag = true;
+  bool okUpright = true;
+
+  float x0 = imu.readFloatAccelX();
+  float y0 = imu.readFloatAccelY();
+  float z0 = imu.readFloatAccelZ();
+  float lastX = x0, lastY = y0, lastZ = z0;
+
+  for (int i = 1; i < STABILITY_SAMPLES; i++) {
+    float x = imu.readFloatAccelX();
+    float y = imu.readFloatAccelY();
+    float z = imu.readFloatAccelZ();
+
+    float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
+    float delta = sqrtf(dx*dx + dy*dy + dz*dz);
+    sumDelta += delta;
+
+    float mag2 = x*x + y*y + z*z;
+    if (mag2 < (ACCEL_MAGNITUDE_MIN*ACCEL_MAGNITUDE_MIN) ||
+        mag2 > (ACCEL_MAGNITUDE_MAX*ACCEL_MAGNITUDE_MAX)) {
+      okMag = false;
+      break; // early exit
+    }
+    Serial.print(sqrt(mag2)); Serial.print(", ");
+
+    if (requireUpright) {
+      float mag = sqrtf(mag2);
+      float zN = z / mag;              // normalized z
+      if (zN < 0.9f) {                 // tune: 0.9 ~ within ~25°
+        okUpright = false;
+        break;
+      }
+    }
+
+    lastX = x; lastY = y; lastZ = z;
+    delay(10);
+  }
+  Serial.println();
+  Serial.print("Stability Check - ");
+  Serial.print("Mag OK: "); Serial.println(okMag);
+  Serial.print("Upright OK: "); Serial.println(okUpright);
+  float avgDelta = sumDelta / (STABILITY_SAMPLES - 1);
+  Serial.print("Avg Delta: "); Serial.print(avgDelta);
+  Serial.print("avgDelta < "); Serial.print(ACCEL_DEVIATION_THRESHOLD);
+  Serial.println(avgDelta < ACCEL_DEVIATION_THRESHOLD ? " TRUE" : " FALSE");
+  return okMag && okUpright && (avgDelta < ACCEL_DEVIATION_THRESHOLD);
+}
 
 // Load Cell Configuration
 HX711 loadcell;
@@ -50,7 +101,7 @@ bool bleConnected = false;
 volatile bool dataPendingToSend = false;
 volatile bool shouldAdvertise = false;
 uint32_t lastConsumptionValue = 0;
-bool glassChanded = false;
+bool glassChanged = false;
 float hydrationGoal = 2000.0; // Default 2000ml
 float totalConsumed = 0.0;
 
@@ -127,48 +178,6 @@ float getWeight() {
   }
 }
 
-bool isUprightStable() {
-  // Collect multiple samples to check for stability
-  // Initialize previous-sample values from the first reading in this call
-  float sumDeviation = 0.0f;
-  bool isStable = true;
-  float lastZ = 0.0f;
-
-  for (int i = 0; i < STABILITY_SAMPLES; i++) {
-    // Read accelerometer data
-    float accelX = imu.readFloatAccelX();
-    float accelY = imu.readFloatAccelY();
-    float accelZ = imu.readFloatAccelZ();
-
-    // Check if Z-axis acceleration is in upright range
-    if (accelZ < UPRIGHT_Z_MIN || accelZ > UPRIGHT_Z_MAX) {
-      return false; // Not in upright orientation
-    }
-
-    // For the first sample, seed lastZ so we don't compare against stale state
-    if (i == 0) {
-      lastZ = accelZ;
-    }
-
-    // Check for stability: deviation from previous sample within this call
-    float deviation = fabsf(accelZ - lastZ);
-    sumDeviation += deviation;
-
-    // Check that X and Y are close to zero (minimal lateral acceleration)
-    if (fabsf(accelX) > ACCEL_STABILITY_THRESHOLD || fabsf(accelY) > ACCEL_STABILITY_THRESHOLD) {
-      isStable = false;
-    }
-
-    lastZ = accelZ;
-    delay(10); // Small delay between samples
-  }
-
-  // Average deviation across samples (first sample contributes 0)
-  float avgDeviation = sumDeviation / (STABILITY_SAMPLES - 1);
-
-  return isStable && (avgDeviation < ACCEL_STABILITY_THRESHOLD);
-}
-
 // ISR for IMU wake-up interrupt (FreeRTOS-safe)
 void imuInterruptHandler() {
   printf("IMU Interrupt Triggered\n");
@@ -221,55 +230,6 @@ void setupIMUWakeup() {
 void clearIMUInterrupt() {
   uint8_t wakeupSrc;
   imu.readRegister(&wakeupSrc, 0x1B); // Read WAKE_UP_SRC to clear interrupt
-}
-
-bool isStable() {
-  // Collect multiple samples to check for stability (any orientation)
-  // Initialize previous-sample values from the first reading in this call
-  float sumDeviation = 0.0f;
-  bool isStable = true;
-  float lastX = 0.0f;
-  float lastY = 0.0f;
-  float lastZ = 0.0f;
-
-  for (int i = 0; i < STABILITY_SAMPLES; i++) {
-    // Read accelerometer data
-    float accelX = imu.readFloatAccelX();
-    float accelY = imu.readFloatAccelY();
-    float accelZ = imu.readFloatAccelZ();
-
-    // For the first sample, seed last values so we don't compare against stale state
-    if (i == 0) {
-      lastX = accelX;
-      lastY = accelY;
-      lastZ = accelZ;
-    }
-
-    // Check for stability: deviation from previous values within this call
-    float deviationX = fabsf(accelX - lastX);
-    float deviationY = fabsf(accelY - lastY);
-    float deviationZ = fabsf(accelZ - lastZ);
-    sumDeviation += (deviationX + deviationY + deviationZ);
-
-    // Check if the magnitude of acceleration deviates from 1g (earth's gravity)
-    // This indicates motion regardless of device orientation
-    float accelMagnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
-    float magnitudeDeviation = fabsf(accelMagnitude - 1.0f); // 1.0g is gravity at rest
-
-    if (magnitudeDeviation > MAGNITUDE_THRESHOLD) {
-      isStable = false;
-    }
-
-    lastX = accelX;
-    lastY = accelY;
-    lastZ = accelZ;
-    delay(10); // Small delay between samples
-  }
-
-  // Average deviation across samples and axes
-  float avgDeviation = sumDeviation / ((STABILITY_SAMPLES - 1) * 3);
-
-  return isStable && (avgDeviation < ACCEL_STABILITY_THRESHOLD);
 }
 
 // BLE Connection Callbacks
@@ -469,8 +429,8 @@ void ledFeedbackTask(void *pvParameters) {
 // Determine initial state based on glass presence and stability
 void determineInitialState() {
   bool glassPresent = isGlassPresent();
-  bool uprightStable = isUprightStable();
-  bool stable = isStable();
+  bool uprightStable = isStableGeneric(true);
+  bool stable = isStableGeneric(false);
 
   if (glassPresent && uprightStable) {
     currentState = DeviceState::IDLE_WITH_GLASS;
@@ -505,7 +465,8 @@ void determineInitialState() {
 
 void setup() {
   Serial.begin(115200);
-  //while (!Serial) { delay(10); }
+  while (!Serial) { delay(10); } // TODO: Remove for production
+  delay(500);
 
   // Configure battery charging current to 100mA
   pinMode(22, OUTPUT);
@@ -535,12 +496,17 @@ void setup() {
   }
   
   // Initialize load cell TODO: Uncomment when load cell is working
-  /*
   loadcell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  digitalWrite(LOADCELL_SCK_PIN, HIGH);
+  delayMicroseconds(100); // Short pulse
+  digitalWrite(LOADCELL_SCK_PIN, LOW);
+  while (!loadcell.is_ready()) {
+    delay(10);
+  }
   loadcell.set_scale(LOADCELL_CALIBRATION_FACTOR); // Apply calibration factor
-  loadcell.tare(); // Reset the scale to 
+  loadcell.set_offset(0); // Reset offset
   Serial.println("Load cell initialized");
-  */
+  
 
   // Initialize BLE
   setupBLE();
@@ -552,6 +518,9 @@ void setup() {
 
   xTaskCreate(ledAlertTask, "LED Alert Task", 256, NULL, 1, &ledAlertTaskHandle);
   xTaskCreate(ledFeedbackTask, "LED Feedback Task", 256, NULL, 1, &ledFeedbackTaskHandle);
+
+  // Disable when testing, TODO: Enable when ready
+  // determineInitialState(); 
 
   Serial.println("Coaster Clip Main Setup");
   delay(500);
@@ -600,20 +569,29 @@ void loop() {
 
         else if (evt.type == EventType::CHECK_FOR_DRINK) {
           // Read weight from load cell
-          float weight = getWeight();
-          if (weight >= 0) {
-            float drinkAmount = prevWeight - weight;
-            if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
-              totalConsumed += drinkAmount;
-              Serial.print("Drink detected: ");
-              Serial.print(drinkAmount);
-              Serial.println(" g");
+          if (glassChanged) {
+            // If glass state changed, reset previous weight
+            prevWeight = getWeight();
+            glassChanged = false;
+            Serial.print("Glass state changed, resetting previous weight to ");
+            Serial.print(prevWeight);
+            Serial.println(" g");
+          } else {
+            float weight = getWeight();
+            if (weight >= 0) {
+              float drinkAmount = prevWeight - weight;
+              if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
+                totalConsumed += drinkAmount;
+                Serial.print("Drink detected: ");
+                Serial.print(drinkAmount);
+                Serial.println(" g");
 
-              // Update previous weight
-              prevWeight = weight;
+                // Update previous weight
+                prevWeight = weight;
 
-              // Send consumption event via BLE
-              sendConsumptionEvent(millis(), (uint32_t)drinkAmount);
+                // Send consumption event via BLE
+                sendConsumptionEvent(millis(), (uint32_t)drinkAmount);
+              }
             }
           }
         }
@@ -627,6 +605,11 @@ void loop() {
             Event removeEvt;
             removeEvt.type = EventType::GLASS_REMOVED;
             xQueueSend(eventQueue, &removeEvt, 0);
+            glassChanged = true;
+          }
+          float weight = getWeight();
+          if (weight >= 0) {
+            prevWeight = weight; // Update previous weight
           }
         }
 
@@ -653,6 +636,7 @@ void loop() {
             Event placeEvt;
             placeEvt.type = EventType::GLASS_PLACED;
             xQueueSend(eventQueue, &placeEvt, 0);
+            glassChanged = true;
           }
         }
       
@@ -664,7 +648,7 @@ void loop() {
         if (evt.type == EventType::HEARTBEAT_TICK) {
           Event e;
           bool sendEvent = false;
-          bool isStableUpright = isUprightStable();
+          bool isStableUpright = isStableGeneric(true);
 
           if (isStableUpright && glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
@@ -683,6 +667,7 @@ void loop() {
             
             e.type = EventType::GLASS_REMOVED;
             sendEvent = true;
+            glassChanged = true;
           }          
           else if (!isStableUpright && !glassPresent) {
             currentState = DeviceState::MOVING_NO_GLASS;
@@ -690,6 +675,7 @@ void loop() {
             
             e.type = EventType::GLASS_REMOVED;
             sendEvent = true;
+            glassChanged = true;
           }
           if (sendEvent) {
             xQueueSend(eventQueue, &e, 0);
@@ -703,7 +689,7 @@ void loop() {
 
         // On heartbeat, check accel for any stable position and for glass placement
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          bool isDeviceStable = isStable();
+          bool isDeviceStable = isStableGeneric(false);
           
           if (isDeviceStable && glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
@@ -714,6 +700,7 @@ void loop() {
             Event e;
             e.type = EventType::GLASS_PLACED;
             xQueueSend(eventQueue, &e, 0);
+            glassChanged = true;
           }
           else if (isDeviceStable && !glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
@@ -728,6 +715,7 @@ void loop() {
             Event e;
             e.type = EventType::GLASS_PLACED;
             xQueueSend(eventQueue, &e, 0);
+            glassChanged = true;
           }
         }
         break;
@@ -736,20 +724,11 @@ void loop() {
         // Testing state
         Serial.println("State: TEST");
         
-        if (evt.type == EventType::HEARTBEAT_TICK) {
-          /*
-          // Read raw accelerometer values
-          float accelX = imu.readFloatAccelX();
-          float accelY = imu.readFloatAccelY();
-          float accelZ = imu.readFloatAccelZ();
-          
-          // Calculate magnitude of acceleration
-          float accelMagnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
-          
+        if (evt.type == EventType::HEARTBEAT_TICK) {          
           // Test isUprightStable function
-          bool isUpright = isUprightStable();
+          bool isUpright = isStableGeneric(true);
           // Test isStable (any orientation)
-          bool isAnyStable = isStable();
+          bool isAnyStable = isStableGeneric(false);
 
           // Test load cell
           float weight = getWeight();
@@ -759,28 +738,13 @@ void loop() {
           bool glassPresent = isGlassPresent();
 
           // Print all values to serial monitor
-          Serial.print("AccelX: ");
-          Serial.print(accelX, 3);
-          Serial.print(" | AccelY: ");
-          Serial.print(accelY, 3);
-          Serial.print(" | AccelZ: ");
-          Serial.print(accelZ, 3);
-          Serial.print(" | Magnitude: ");
-          Serial.print(accelMagnitude, 3);
           Serial.print(" | Upright+Stable: ");
           Serial.print(isUpright ? "YES" : "NO");
           Serial.print(" | Stable(any): ");
           Serial.println(isAnyStable ? "YES" : "NO");
           
-          Serial.print("Z Range Check (g): [");
-          Serial.print(UPRIGHT_Z_MIN, 3);
-          Serial.print(" - ");
-          Serial.print(UPRIGHT_Z_MAX, 3);
-          Serial.print("] = ");
-          Serial.println((accelZ >= UPRIGHT_Z_MIN && accelZ <= UPRIGHT_Z_MAX) ? "IN RANGE" : "OUT OF RANGE");
-          
           Serial.print("Load Cell Weight: ");
-          if (weight >= 0) {
+          if (1) {
             Serial.print(weight, 2);
             Serial.println(" units");
           } else {
@@ -790,7 +754,7 @@ void loop() {
           Serial.print("Hall Sensor: ");
           Serial.print(hallValue);
           Serial.print(" | Glass Present: ");
-          Serial.println(glassPresent ? "YES" : "NO");*/
+          Serial.println(glassPresent ? "YES" : "NO");
           
           // BLE Test Status
           Serial.print("BLE Connected: ");
