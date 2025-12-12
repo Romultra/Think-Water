@@ -8,6 +8,7 @@
 #include <math.h>
 #include <HX711.h>
 #include <Adafruit_FlashTransport.h>
+#include <Adafruit_NeoPixel.h>
 
 Adafruit_FlashTransport_QSPI flashTransport;
 
@@ -21,6 +22,11 @@ const int HALL_SENSOR_PIN = A0;
 const int IMU_INT1_PIN = PIN_LSM6DS3TR_C_INT1; // LSM6DS3TR-C INT1 pin on XIAO nrf52840 Sense
 const int LOADCELL_DOUT_PIN = D2;
 const int LOADCELL_SCK_PIN = D3;
+const int NEON_PIXEL_PIN = D1;
+
+// NeoPixel configuration
+#define NUM_NEOPIXELS 10
+Adafruit_NeoPixel strip(NUM_NEOPIXELS, NEON_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // Accelerometer Configuration
 LSM6DS3 imu(I2C_MODE, 0x6A); // I2C address for Seeed XIAO nrf52840 Sense
@@ -30,8 +36,8 @@ LSM6DS3 imu(I2C_MODE, 0x6A); // I2C address for Seeed XIAO nrf52840 Sense
 // Stability Detection Configuration
 const int STABILITY_SAMPLES = 10;      // Number of samples to check for stability
 const float ACCEL_DEVIATION_THRESHOLD = 0.05; // Max deviation between samples to consider stable
-const float ACCEL_MAGNITUDE_MIN = 0.95;  // Minimum magnitude for stable (close to 1g)
-const float ACCEL_MAGNITUDE_MAX = 1.1;  // Maximum magnitude for stable (close to 1g)
+const float ACCEL_MAGNITUDE_MIN = 1.04;  // Minimum magnitude for stable (close to 1g)
+const float ACCEL_MAGNITUDE_MAX = 1.08;  // Maximum magnitude for stable (close to 1g)
 
 bool isStableGeneric(bool requireUpright) {
   if (STABILITY_SAMPLES < 2) return false;
@@ -72,14 +78,14 @@ bool isStableGeneric(bool requireUpright) {
     }
 
     lastX = x; lastY = y; lastZ = z;
-    delay(10);
+    delay(50);
   }
   Serial.println();
   Serial.print("Stability Check - ");
   Serial.print("Mag OK: "); Serial.println(okMag);
   Serial.print("Upright OK: "); Serial.println(okUpright);
   float avgDelta = sumDelta / (STABILITY_SAMPLES - 1);
-  Serial.print("Avg Delta: "); Serial.print(avgDelta);
+  Serial.print("Avg Delta: "); Serial.print(avgDelta*1000.0f); Serial.print(" mg | ");
   Serial.print("avgDelta < "); Serial.print(ACCEL_DEVIATION_THRESHOLD);
   Serial.println(avgDelta < ACCEL_DEVIATION_THRESHOLD ? " TRUE" : " FALSE");
   return okMag && okUpright && (avgDelta < ACCEL_DEVIATION_THRESHOLD);
@@ -118,8 +124,6 @@ const int SLOW_POLL_MS = 2000; // Check slow when idle (Deep Sleep Duty Cycle)
 
 enum class EventType {
   HEARTBEAT_TICK,
-  GLASS_PLACED,
-  GLASS_REMOVED,
   CHECK_FOR_DRINK,
   MOTION_DETECTED,
   BLE_COMMAND_RECEIVED,
@@ -141,6 +145,7 @@ enum class DeviceState {
 };
 
 DeviceState currentState = DeviceState::TEST;
+//DeviceState currentState;
 
 QueueHandle_t eventQueue;
 TimerHandle_t heartbeatTimer;
@@ -388,41 +393,139 @@ bool sendConsumptionEvent(uint32_t timestamp, uint32_t value) {
 void ledAlertTask(void *pvParameters) {
   (void)pvParameters;
 
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+  // Use NeoPixel strip for alerts instead of built-in LED
+  // Warm red color (tweak as desired)
+  const uint8_t baseR = 255;
+  const uint8_t baseG = 40;
+  const uint8_t baseB = 20;
+
+  const int blinkCount = 3;
+  const int blinkPeriodMs = 600; // total period per blink (rise+fall)
+  const int stepMs = 20; // time per step for smoothness
+  const int steps = blinkPeriodMs / stepMs; // e.g., 600/20 = 30
+
+  // Ensure strip is off initially
+  strip.clear();
+  strip.show();
 
   while (1) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for notification
 
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(LED_BUILTIN, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(600));
-      digitalWrite(LED_BUILTIN, LOW);
-      vTaskDelay(pdMS_TO_TICKS(600));
+    for (int b = 0; b < blinkCount; b++) {
+      for (int s = 0; s < steps; s++) {
+        // theta goes 0..2PI to produce rise then fall
+        float theta = (2.0f * 3.14159265f * (float)s) / (float)(steps - 1);
+        float br = (1.0f - cosf(theta)) * 0.5f; // 0..1..0
+        uint8_t bri = (uint8_t)(br * 255.0f);
+
+        // scale color by brightness
+        uint8_t r = (uint8_t)((baseR * (uint16_t)bri) / 255);
+        uint8_t g = (uint8_t)((baseG * (uint16_t)bri) / 255);
+        uint8_t bl = (uint8_t)((baseB * (uint16_t)bri) / 255);
+
+        // Set all pixels to the same warm red at computed brightness
+        for (int i = 0; i < NUM_NEOPIXELS; i++) {
+          strip.setPixelColor(i, strip.Color(r, g, bl));
+        }
+        strip.show();
+
+        vTaskDelay(pdMS_TO_TICKS(stepMs));
+      }
     }
+
+    // Turn off after sequence
+    strip.clear();
+    strip.show();
   }
 }
 
 void ledFeedbackTask(void *pvParameters) {
   (void)pvParameters;
 
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+  // Use NeoPixel strip to display progress towards hydration goal
+  const uint8_t baseR = 30;   // encouraging green
+  const uint8_t baseG = 200;
+  const uint8_t baseB = 80;
+  const int fullDurationMs = 1100; // total time to animate to 100%
+  const int stepMs = 20; // animation timestep
 
   while (1) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for notification
 
-    // Give feedback on progress towards hydration goal
-    float progress = (totalConsumed / hydrationGoal);
-    // TODO: Change to use external neopixel LED instead of built-in LED
-    int blinkCount = (int)(progress * 10); // Up to 10 blinks
-    blinkCount = constrain(blinkCount, 1, 10);
-    for (int i = 0; i < blinkCount; i++) {
-      digitalWrite(LED_BUILTIN, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(300));
-      digitalWrite(LED_BUILTIN, LOW);
-      vTaskDelay(pdMS_TO_TICKS(300));
+    float progress = totalConsumed / hydrationGoal;
+    if (!isfinite(progress)) progress = 0.0f;
+    progress = constrain(progress, 0.0f, 1.0f);
+
+    // If nothing to show, clear and continue
+    if (progress <= 0.0f) {
+      strip.clear();
+      strip.show();
+      continue;
     }
+
+    // Determine per-LED final target brightness (0..1)
+    float target = progress * (float)NUM_NEOPIXELS;
+    int full = (int)floor(target);
+    float frac = target - (float)full; // partial brightness for next LED
+
+    // Total animation duration proportional to progress
+    int T = max((int)(fullDurationMs * progress), stepMs);
+    int steps = max(1, T / stepMs);
+
+    // Each LED's start is staggered across total duration
+    float segTime = (float)T / (float)NUM_NEOPIXELS;
+
+    for (int s = 0; s <= steps; s++) {
+      int currentMs = s * stepMs;
+
+      for (int i = 0; i < NUM_NEOPIXELS; i++) {
+        // desired final brightness for this LED (0..1)
+        float tgtBr = 0.0f;
+        if (i < full) tgtBr = 1.0f;
+        else if (i == full) tgtBr = frac;
+        else tgtBr = 0.0f;
+
+        if (tgtBr <= 0.0f) {
+          strip.setPixelColor(i, 0);
+          continue;
+        }
+
+        // local progress for this LED from its staggered start
+        float startMs = i * segTime;
+        float local = (currentMs - startMs) / segTime;
+        local = constrain(local, 0.0f, 1.0f);
+
+        // smooth ease (0..1)
+        float ease = (1.0f - cosf(local * 3.14159265f)) * 0.5f;
+
+        // actual brightness scales to target brightness
+        float bri = tgtBr * ease;
+
+        uint8_t r = (uint8_t)((float)baseR * bri + 0.5f);
+        uint8_t g = (uint8_t)((float)baseG * bri + 0.5f);
+        uint8_t b = (uint8_t)((float)baseB * bri + 0.5f);
+
+        strip.setPixelColor(i, strip.Color(r, g, b));
+      }
+
+      strip.show();
+      vTaskDelay(pdMS_TO_TICKS(stepMs));
+    }
+
+    // Ensure final exact state matches progress
+    for (int i = 0; i < NUM_NEOPIXELS; i++) {
+      if (i < full) {
+        strip.setPixelColor(i, strip.Color(baseR, baseG, baseB));
+      } else if (i == full && frac > 0.0f) {
+        uint8_t r = (uint8_t)((float)baseR * frac + 0.5f);
+        uint8_t g = (uint8_t)((float)baseG * frac + 0.5f);
+        uint8_t b = (uint8_t)((float)baseB * frac + 0.5f);
+        strip.setPixelColor(i, strip.Color(r, g, b));
+      } else {
+        strip.setPixelColor(i, 0);
+      }
+    }
+    strip.show();
   }
 }
 
@@ -506,6 +609,10 @@ void setup() {
   loadcell.set_scale(LOADCELL_CALIBRATION_FACTOR); // Apply calibration factor
   loadcell.set_offset(0); // Reset offset
   Serial.println("Load cell initialized");
+  // Initialize NeoPixel strip
+  strip.begin();
+  strip.setBrightness(255);
+  strip.show();
   
 
   // Initialize BLE
@@ -601,10 +708,7 @@ void loop() {
           if (!glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
             Serial.println("Transition to IDLE_NO_GLASS");
-            // Create GLASS_REMOVED event
-            Event removeEvt;
-            removeEvt.type = EventType::GLASS_REMOVED;
-            xQueueSend(eventQueue, &removeEvt, 0);
+
             glassChanged = true;
           }
           float weight = getWeight();
@@ -632,10 +736,7 @@ void loop() {
           if (glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
-            // Create GLASS_PLACED event
-            Event placeEvt;
-            placeEvt.type = EventType::GLASS_PLACED;
-            xQueueSend(eventQueue, &placeEvt, 0);
+
             glassChanged = true;
           }
         }
@@ -665,16 +766,12 @@ void loop() {
             // Switch to a slower heartbear tick for idle state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
             
-            e.type = EventType::GLASS_REMOVED;
-            sendEvent = true;
             glassChanged = true;
           }          
           else if (!isStableUpright && !glassPresent) {
             currentState = DeviceState::MOVING_NO_GLASS;
             Serial.println("Transition to MOVING_NO_GLASS");
             
-            e.type = EventType::GLASS_REMOVED;
-            sendEvent = true;
             glassChanged = true;
           }
           if (sendEvent) {
@@ -697,9 +794,6 @@ void loop() {
             // Switch to a slower heartbear tick for idle state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
             
-            Event e;
-            e.type = EventType::GLASS_PLACED;
-            xQueueSend(eventQueue, &e, 0);
             glassChanged = true;
           }
           else if (isDeviceStable && !glassPresent) {
@@ -712,9 +806,6 @@ void loop() {
             currentState = DeviceState::MOVING_WITH_GLASS;
             Serial.println("Transition to MOVING_WITH_GLASS");
             
-            Event e;
-            e.type = EventType::GLASS_PLACED;
-            xQueueSend(eventQueue, &e, 0);
             glassChanged = true;
           }
         }
@@ -729,13 +820,13 @@ void loop() {
           bool isUpright = isStableGeneric(true);
           // Test isStable (any orientation)
           bool isAnyStable = isStableGeneric(false);
-
+          
           // Test load cell
           float weight = getWeight();
-          
+          /*
           // Test hall sensor
           int hallValue = analogRead(HALL_SENSOR_PIN);
-          bool glassPresent = isGlassPresent();
+          bool glassPresent = isGlassPresent();*/
 
           // Print all values to serial monitor
           Serial.print(" | Upright+Stable: ");
@@ -750,7 +841,7 @@ void loop() {
           } else {
             Serial.println("ERROR");
           }
-          
+          /*
           Serial.print("Hall Sensor: ");
           Serial.print(hallValue);
           Serial.print(" | Glass Present: ");
@@ -764,7 +855,7 @@ void loop() {
           Serial.print(" | Data Pending: ");
           Serial.println(dataPendingToSend ? "YES" : "NO");
           
-          Serial.println("---");
+          Serial.println("---");*/
           
           // BLE Test: If connected, send test consumption data
           if (bleConnected && dataPendingToSend) {
