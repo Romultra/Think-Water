@@ -33,6 +33,11 @@ const float THRESHOLD_DRINK_AMOUNT = 5.0; // Minimum weight change (grams) to re
 float prevWeight = 0.0;
 
 // Loadcell stability results (updated by background task)
+// NOTE: Volatile variables for cross-task communication (ISR-safe for bool/int types).
+// For float values, reading may not be atomic on all platforms. In this application,
+// slightly stale or partially-read float values don't compromise safety (worst case:
+// one incorrect stability reading). For critical applications, use FreeRTOS mutexes
+// or atomic types. The loadcellStabilityTask writes, main loop reads.
 volatile bool loadcellStable = false;
 volatile float loadcellLastWeight = 0.0f;
 
@@ -50,7 +55,7 @@ BLECharacteristic goalChar(GOAL_CHAR_UUID);
 bool bleConnected = false;
 volatile bool dataPendingToSend = false;
 volatile bool shouldAdvertise = false;
-uint32_t lastConsumptionValue = 0;
+int32_t lastConsumptionValue = 0;  // Scaled by 100 (e.g., 1550 = 15.50g)
 bool glassChanged = false;
 float hydrationGoal = 2000.0; // Default 2000ml
 float totalConsumed = 0.0;
@@ -103,13 +108,13 @@ void heartbeatCallback(TimerHandle_t xTimer) {
   // Notify the loadcell stability task to perform the time-wise check.
   // That task will enqueue the actual HEARTBEAT_TICK event after completing checks.
   if (loadcellStabilityTaskHandle) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    vTaskNotifyGiveFromISR(loadcellStabilityTaskHandle, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    xTaskNotifyGive(loadcellStabilityTaskHandle);
   } else {
     // Fallback: if task not ready, still send heartbeat event
     Event evt;
     evt.type = EventType::HEARTBEAT_TICK;
+    evt.timestamp = millis();
+    evt.value = 0;
     xQueueSend(eventQueue, &evt, 0);
   }
 }
@@ -140,9 +145,9 @@ static bool performLoadcellStabilityCheck(float &outWeight) {
   float sumDelta = 0.0f;
 
   for (int i = 1; i < STABILITY_SAMPLES; i++) {
-    delay(50);
+    vTaskDelay(pdMS_TO_TICKS(50));
     float w = getWeight();
-    if (w < 0) { outWeight = -1.0f; return false; }
+    if (isnan(w)) { outWeight = NAN; return false; }
     float d = fabsf(w - last);
     sumDelta += d;
     last = w;
@@ -186,13 +191,12 @@ void loadcellStabilityTask(void *pvParameters) {
 
 bool isGlassPresent() {
   int val = analogRead(HALL_SENSOR_PIN);
-  if (val > THRESHOLD_HIGH) {
-    return true;
-  } else if (val < THRESHOLD_LOW) {
-    return false;
-  }
   // In hysteresis zone, keep previous state. For the inital call, use middle of threshold as a binary state.
   static bool lastState = (val >= (THRESHOLD_HIGH + THRESHOLD_LOW) / 2);
+
+  if (val > THRESHOLD_HIGH) lastState = true;
+  else if (val < THRESHOLD_LOW) lastState = false;
+
   return lastState;
 }
 
@@ -278,7 +282,7 @@ void setupBLE() {
   commandChar.setProperties(CHR_PROPS_WRITE);
   commandChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
   commandChar.setWriteCallback(command_write_callback);
-  commandChar.setFixedLen(4); // command code + optional data
+  commandChar.setMaxLen(4); // command code + optional data
   commandChar.begin();
   
   // Configure Goal Characteristic (Write only)
@@ -288,7 +292,7 @@ void setupBLE() {
   goalChar.setFixedLen(4); // float value (ml)
   goalChar.begin();
   
-  // Setup advertising (but don't start yet - only when we have data)
+  // Setup advertising
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(coasterService);
@@ -297,9 +301,9 @@ void setupBLE() {
   // Set advertising interval (units of 0.625ms)
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.setInterval(160, 320);    // 100-200ms (balance power/discovery)
-  Bluefruit.Advertising.setFastTimeout(30);       // Fast advertising for 30s, then slow
+  Bluefruit.Advertising.setFastTimeout(10);       // Fast advertising for 10s, then slow (power saving)
   
-  Serial.println("BLE initialized (not advertising yet)");
+  Serial.println("BLE initialized");
 }
 
 // Start BLE advertising when we have data to send
@@ -319,7 +323,8 @@ void stopBLEAdvertising() {
 }
 
 // Send consumption event via BLE
-bool sendConsumptionEvent(uint32_t timestamp, uint32_t value) {
+// value is scaled by 100 (e.g., 1550 = 15.50g)
+bool sendConsumptionEvent(uint32_t timestamp, int32_t value) {
   if (!bleConnected) {
     // Not connected, mark data as pending and start advertising
     dataPendingToSend = true;
@@ -329,7 +334,7 @@ bool sendConsumptionEvent(uint32_t timestamp, uint32_t value) {
     return false;
   }
   
-  // Pack data: timestamp(4 bytes) + value(4 bytes)
+  // Pack data: timestamp(4 bytes) + value(4 bytes, signed)
   uint8_t data[8];
   memcpy(data, &timestamp, 4);
   memcpy(data + 4, &value, 4);
@@ -623,28 +628,29 @@ void loop() {
 
         else if (evt.type == EventType::CHECK_FOR_DRINK) {
           // Read weight from load cell
-            if (glassChanged) {
-            // If glass state changed, reset previous weight
-            prevWeight = getWeight();
-            glassChanged = false;
-            Serial.print("Glass state changed, resetting previous weight to ");
-            Serial.print(prevWeight);
-            Serial.println(" g");
+          if (glassChanged) {
+          // If glass state changed, reset previous weight
+          prevWeight = getWeight();
+          glassChanged = false;
+          Serial.print("Glass state changed, resetting previous weight to ");
+          Serial.print(prevWeight);
+          Serial.println(" g");
           } else {
             float weight = getWeight();
             if (!isnan(weight)) {
-              float drinkAmount = fabsf(prevWeight - weight);
+              float drinkAmount = prevWeight - weight;
               if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
                 totalConsumed += drinkAmount;
                 Serial.print("Drink detected: ");
                 Serial.print(drinkAmount);
                 Serial.println(" g");
 
-                // Update previous weight
+              // Update previous weight
                 prevWeight = weight;
 
-                // Send consumption event via BLE (send as positive grams)
-                sendConsumptionEvent(millis(), (uint32_t)drinkAmount);
+                // Send consumption event via BLE (scaled by 100 for decimal precision)
+                int32_t scaledAmount = (int32_t)(drinkAmount * 100.0f + 0.5f);
+                sendConsumptionEvent(millis(), scaledAmount);
               }
             }
           }
@@ -687,6 +693,7 @@ void loop() {
             glassChanged = true;
           }
         }
+        break;
       
       case DeviceState::MOVING_WITH_GLASS:
         // Handle movement with glass
@@ -841,11 +848,11 @@ void loop() {
             Serial.println("\n*** BLE TEST: Sending test consumption event ***");
             float testWeight = getWeight();
             if (testWeight > 0) {
-              uint32_t weightValue = (uint32_t)(testWeight * 100);
+              int32_t weightValue = (int32_t)(testWeight * 100.0f + 0.5f);
               sendConsumptionEvent(millis(), weightValue);
             } else {
               // Send dummy data for testing
-              sendConsumptionEvent(millis(), 15000); // 150.00 grams
+              sendConsumptionEvent(millis(), 15000); // 150.00 grams (scaled)
             }
           } else if (cmd == 'a' || cmd == 'A') {
             Serial.println("\n*** BLE TEST: Starting advertising ***");
