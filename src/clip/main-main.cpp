@@ -20,17 +20,17 @@ Adafruit_FlashTransport_QSPI flashTransport;
 const int HALL_SENSOR_PIN = A0;
 const int LOADCELL_DOUT_PIN = D2;
 const int LOADCELL_SCK_PIN = D3;
-const int NEON_PIXEL_PIN = D1;
+const int NEO_PIXEL_PIN = D1;
 
 // NeoPixel configuration
 #define NUM_NEOPIXELS 10
-Adafruit_NeoPixel strip(NUM_NEOPIXELS, NEON_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip(NUM_NEOPIXELS, NEO_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // Load Cell Configuration
 HX711 loadcell;
-const float LOADCELL_CALIBRATION_FACTOR = 1.0; // Placeholder - needs calibration
+const float LOADCELL_CALIBRATION_FACTOR = 1.0; // Placeholder - needs calibration TODO
 const float THRESHOLD_DRINK_AMOUNT = 5.0; // Minimum weight change (grams) to register a drink event
-float prevWeight = 0.0;
+float prevWeight = NAN; // NAN until first valid measurement
 
 // Loadcell stability results (updated by background task)
 // NOTE: Volatile variables for cross-task communication (ISR-safe for bool/int types).
@@ -54,16 +54,13 @@ BLECharacteristic goalChar(GOAL_CHAR_UUID);
 
 bool bleConnected = false;
 volatile bool dataPendingToSend = false;
-volatile bool shouldAdvertise = false;
 int32_t lastConsumptionValue = 0;  // Scaled by 100 (e.g., 1550 = 15.50g)
 bool glassChanged = false;
 float hydrationGoal = 2000.0; // Default 2000ml
 float totalConsumed = 0.0;
 
 // Hysteresis prevents "flickering" events
-// Glass is present if value > 600
-// Glass is removed if value < 500
-// Between 500-600, we keep the previous state
+// TODO: Calibrate these thresholds experimentally
 const int THRESHOLD_HIGH = 600; 
 const int THRESHOLD_LOW = 500;
 
@@ -74,9 +71,7 @@ const int SLOW_POLL_MS = 2000; // Check slow when idle (Deep Sleep Duty Cycle)
 enum class EventType {
   HEARTBEAT_TICK,
   CHECK_FOR_DRINK,
-  MOTION_DETECTED,
-  BLE_COMMAND_RECEIVED,
-  WAKEUP
+  BLE_COMMAND_RECEIVED
 };
 
 struct Event {
@@ -98,6 +93,7 @@ DeviceState currentState = DeviceState::TEST;
 
 QueueHandle_t eventQueue;
 TimerHandle_t heartbeatTimer;
+SemaphoreHandle_t ledMutex;
 
 TaskHandle_t ledAlertTaskHandle;
 TaskHandle_t ledFeedbackTaskHandle;
@@ -220,8 +216,8 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   
   bleConnected = false;
   
-  // If we still have data to send or need to advertise, restart advertising
-  if (dataPendingToSend || shouldAdvertise) {
+  // If we still have data to send, restart advertising
+  if (dataPendingToSend) {
     Bluefruit.Advertising.start(0); // Advertise indefinitely until connected
     Serial.println("Restarting advertising (data pending)");
   }
@@ -353,7 +349,6 @@ bool sendConsumptionEvent(uint32_t timestamp, int32_t value) {
   }
 }
 
-// TODO: Change To use external neopixel LED instead of built-in LED
 void ledAlertTask(void *pvParameters) {
   (void)pvParameters;
 
@@ -368,12 +363,11 @@ void ledAlertTask(void *pvParameters) {
   const int stepMs = 20; // time per step for smoothness
   const int steps = blinkPeriodMs / stepMs; // e.g., 600/20 = 30
 
-  // Ensure strip is off initially
-  strip.clear();
-  strip.show();
-
   while (1) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for notification
+
+    // Acquire mutex to prevent concurrent LED access
+    if (xSemaphoreTake(ledMutex, portMAX_DELAY) != pdTRUE) continue;
 
     for (int b = 0; b < blinkCount; b++) {
       for (int s = 0; s < steps; s++) {
@@ -400,6 +394,8 @@ void ledAlertTask(void *pvParameters) {
     // Turn off after sequence
     strip.clear();
     strip.show();
+
+    xSemaphoreGive(ledMutex);
   }
 }
 
@@ -416,14 +412,18 @@ void ledFeedbackTask(void *pvParameters) {
   while (1) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for notification
 
+    // Acquire mutex to prevent concurrent LED access
+    if (xSemaphoreTake(ledMutex, portMAX_DELAY) != pdTRUE) continue;
+
     float progress = totalConsumed / hydrationGoal;
     if (!isfinite(progress)) progress = 0.0f;
     progress = constrain(progress, 0.0f, 1.0f);
 
-    // If nothing to show, clear and continue
+    // If nothing to show, clear and release mutex
     if (progress <= 0.0f) {
       strip.clear();
       strip.show();
+      xSemaphoreGive(ledMutex);
       continue;
     }
 
@@ -490,6 +490,8 @@ void ledFeedbackTask(void *pvParameters) {
       }
     }
     strip.show();
+
+    xSemaphoreGive(ledMutex);
   }
 }
 
@@ -545,8 +547,11 @@ void setup() {
 
   // Create a Queue that can hold 10 events (must exist before ISR runs)
   eventQueue = xQueueCreate(10, sizeof(Event));
-  
-  // Initialize load cell TODO: Uncomment when load cell is working
+
+  // Create mutex for LED strip access
+  ledMutex = xSemaphoreCreateMutex();
+
+  // Initialize load cell
   loadcell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
   digitalWrite(LOADCELL_SCK_PIN, HIGH);
   delayMicroseconds(100); // Short pulse
@@ -614,30 +619,18 @@ void loop() {
       case DeviceState::IDLE_WITH_GLASS:
         // Monitor for drinking activity
         Serial.println("State: IDLE_WITH_GLASS");
-        
-        // Wait for waik-up interupt from accellerometer
-        if (evt.type == EventType::MOTION_DETECTED) {
-          currentState = DeviceState::MOVING_WITH_GLASS;
-          Serial.println("Transition to MOVING_WITH_GLASS");
-          // Switch to a faster heartbear tick for active state
-          xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
 
-          // Give feedback on progress towards hydration goal when glass is picked up
-          xTaskNotifyGive(ledFeedbackTaskHandle);
-        }
-
-        else if (evt.type == EventType::CHECK_FOR_DRINK) {
-          // Read weight from load cell
-          if (glassChanged) {
-          // If glass state changed, reset previous weight
-          prevWeight = getWeight();
-          glassChanged = false;
-          Serial.print("Glass state changed, resetting previous weight to ");
-          Serial.print(prevWeight);
-          Serial.println(" g");
-          } else {
-            float weight = getWeight();
-            if (!isnan(weight)) {
+        if (evt.type == EventType::CHECK_FOR_DRINK) {
+          float weight = getWeight();
+          if (!isnan(weight)) {
+            // Initialize prevWeight on first valid reading or after glass change
+            if (isnan(prevWeight) || glassChanged) {
+              prevWeight = weight;
+              glassChanged = false;
+              Serial.print("Baseline weight set to ");
+              Serial.print(prevWeight);
+              Serial.println(" g");
+            } else {
               float drinkAmount = prevWeight - weight;
               if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
                 totalConsumed += drinkAmount;
@@ -645,7 +638,6 @@ void loop() {
                 Serial.print(drinkAmount);
                 Serial.println(" g");
 
-              // Update previous weight
                 prevWeight = weight;
 
                 // Send consumption event via BLE (scaled by 100 for decimal precision)
@@ -656,17 +648,28 @@ void loop() {
           }
         }
 
-        // On heartbeat: check for glass removal and send pending BLE data
+        // On heartbeat: check for instability (movement) or glass removal
         else if (evt.type == EventType::HEARTBEAT_TICK) {
-          if (!glassPresent) {
+          // Detect movement via loadcell instability
+          if (!loadcellStable) {
+            currentState = DeviceState::MOVING_WITH_GLASS;
+            Serial.println("Transition to MOVING_WITH_GLASS");
+            // Switch to faster heartbeat tick for active state
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+
+            // Give feedback on progress towards hydration goal when glass is picked up
+            xTaskNotifyGive(ledFeedbackTaskHandle);
+          } else if (!glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
             Serial.println("Transition to IDLE_NO_GLASS");
 
             glassChanged = true;
-          }
-          float weight = getWeight();
-          if (!isnan(weight)) {
-            prevWeight = weight; // Update previous weight
+          } else {
+            // Use cached weight from stability task
+            float weight = loadcellLastWeight;
+            if (!isnan(weight)) {
+              prevWeight = weight;
+            }
           }
         }
 
@@ -675,18 +678,15 @@ void loop() {
       case DeviceState::IDLE_NO_GLASS:
         // Monitor for glass placement
         Serial.println("State: IDLE_NO_GLASS");
-        
-        // Wait for waik-up interupt from accellerometer
-        if (evt.type == EventType::MOTION_DETECTED) {
-          currentState = DeviceState::MOVING_NO_GLASS;
-          Serial.println("Transition to MOVING_NO_GLASS");
-          // Switch to a faster heartbear tick for active state
-          xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
-        }
 
-        // On heartbeat: check for glass placement and send pending BLE data
-        else if (evt.type == EventType::HEARTBEAT_TICK) {
-          if (glassPresent) {
+        // On heartbeat: check for instability (movement) or glass placement
+        if (evt.type == EventType::HEARTBEAT_TICK) {
+          if (!loadcellStable) {
+            currentState = DeviceState::MOVING_NO_GLASS;
+            Serial.println("Transition to MOVING_NO_GLASS");
+            // Switch to faster heartbeat tick for active state
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+          } else if (glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
 
@@ -699,36 +699,33 @@ void loop() {
         // Handle movement with glass
         Serial.println("State: MOVING_WITH_GLASS");
 
-        // One heartbeat: check loadcell for stable position and for glass removal
+        // On heartbeat: check loadcell for stable position and for glass removal
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          Event e;
-          bool sendEvent = false;
-            // Use loadcell stability instead of accelerometer upright check
-            if (loadcellStable && glassPresent) {
+          // Use loadcell stability instead of accelerometer upright check
+          if (loadcellStable && glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
-            // Switch to a slower heartbear tick for idle state
+            // Switch to a slower heartbeat tick for idle state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-            
+
+            // Queue CHECK_FOR_DRINK event
+            Event e;
             e.type = EventType::CHECK_FOR_DRINK;
-            sendEvent = true;
-          }
-            else if (loadcellStable && !glassPresent) {
+            e.timestamp = millis();
+            e.value = 0;
+            xQueueSend(eventQueue, &e, 0);
+          } else if (loadcellStable && !glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
             Serial.println("Transition to IDLE_NO_GLASS");
-            // Switch to a slower heartbear tick for idle state
+            // Switch to a slower heartbeat tick for idle state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-            
+
             glassChanged = true;
-          }          
-            else if (!loadcellStable && !glassPresent) {
+          } else if (!loadcellStable && !glassPresent) {
             currentState = DeviceState::MOVING_NO_GLASS;
             Serial.println("Transition to MOVING_NO_GLASS");
-            
+
             glassChanged = true;
-          }
-          if (sendEvent) {
-            xQueueSend(eventQueue, &e, 0);
           }
         }
         break;
@@ -737,29 +734,24 @@ void loop() {
         // Handle movement without glass
         Serial.println("State: MOVING_NO_GLASS");
 
-        // On heartbeat, check accel for any stable position and for glass placement
+        // On heartbeat, check loadcell for stable position and for glass placement
         if (evt.type == EventType::HEARTBEAT_TICK) {
-            // Use loadcell stability cache instead of accel-based check
-            bool isDeviceStable = loadcellStable;
-
-            if (isDeviceStable && glassPresent) {
+          if (loadcellStable && glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
-            // Switch to a slower heartbear tick for idle state
+            // Switch to a slower heartbeat tick for idle state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-            
+
             glassChanged = true;
-          }
-          else if (isDeviceStable && !glassPresent) {
+          } else if (loadcellStable && !glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
             Serial.println("Transition to IDLE_NO_GLASS");
-            // Switch to a slower heartbear tick for idle state
+            // Switch to a slower heartbeat tick for idle state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-          }
-          else if (!isDeviceStable && glassPresent) {
+          } else if (!loadcellStable && glassPresent) {
             currentState = DeviceState::MOVING_WITH_GLASS;
             Serial.println("Transition to MOVING_WITH_GLASS");
-            
+
             glassChanged = true;
           }
         }
@@ -807,12 +799,8 @@ void loop() {
           }
         }
 
-        else if (evt.type == EventType::MOTION_DETECTED) {
-          Serial.println("Motion Detected Event Received");
-        }
-        
         // BLE Test: Handle commands in TEST mode
-        else if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
+        if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
           uint8_t command = (uint8_t)evt.value;
           Serial.println("========================================");
           Serial.print("BLE TEST: Command Received: 0x");
