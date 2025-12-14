@@ -3,7 +3,6 @@
 #include <FreeRTOS.h>
 #include <queue.h>
 #include <task.h>
-#include <LSM6DS3.h>
 #include <Wire.h>
 #include <math.h>
 #include <HX711.h>
@@ -19,7 +18,6 @@ Adafruit_FlashTransport_QSPI flashTransport;
 #define GOAL_CHAR_UUID              "19B10013-E8F2-537E-4F6C-D104768A1214"  // Write hydration goal
 
 const int HALL_SENSOR_PIN = A0;
-const int IMU_INT1_PIN = PIN_LSM6DS3TR_C_INT1; // LSM6DS3TR-C INT1 pin on XIAO nrf52840 Sense
 const int LOADCELL_DOUT_PIN = D2;
 const int LOADCELL_SCK_PIN = D3;
 const int NEON_PIXEL_PIN = D1;
@@ -28,74 +26,20 @@ const int NEON_PIXEL_PIN = D1;
 #define NUM_NEOPIXELS 10
 Adafruit_NeoPixel strip(NUM_NEOPIXELS, NEON_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
-// Accelerometer Configuration
-LSM6DS3 imu(I2C_MODE, 0x6A); // I2C address for Seeed XIAO nrf52840 Sense
-
-// NOTE: the IMU returns accelerations in units of g (1g = 9.80665 m/s^2)
-
-// Stability Detection Configuration
-const int STABILITY_SAMPLES = 10;      // Number of samples to check for stability
-const float ACCEL_DEVIATION_THRESHOLD = 0.05; // Max deviation between samples to consider stable
-const float ACCEL_MAGNITUDE_MIN = 1.04;  // Minimum magnitude for stable (close to 1g)
-const float ACCEL_MAGNITUDE_MAX = 1.08;  // Maximum magnitude for stable (close to 1g)
-
-bool isStableGeneric(bool requireUpright) {
-  if (STABILITY_SAMPLES < 2) return false;
-
-  float sumDelta = 0.0f;
-  bool okMag = true;
-  bool okUpright = true;
-
-  float x0 = imu.readFloatAccelX();
-  float y0 = imu.readFloatAccelY();
-  float z0 = imu.readFloatAccelZ();
-  float lastX = x0, lastY = y0, lastZ = z0;
-
-  for (int i = 1; i < STABILITY_SAMPLES; i++) {
-    float x = imu.readFloatAccelX();
-    float y = imu.readFloatAccelY();
-    float z = imu.readFloatAccelZ();
-
-    float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
-    float delta = sqrtf(dx*dx + dy*dy + dz*dz);
-    sumDelta += delta;
-
-    float mag2 = x*x + y*y + z*z;
-    if (mag2 < (ACCEL_MAGNITUDE_MIN*ACCEL_MAGNITUDE_MIN) ||
-        mag2 > (ACCEL_MAGNITUDE_MAX*ACCEL_MAGNITUDE_MAX)) {
-      okMag = false;
-      break; // early exit
-    }
-    Serial.print(sqrt(mag2)); Serial.print(", ");
-
-    if (requireUpright) {
-      float mag = sqrtf(mag2);
-      float zN = z / mag;              // normalized z
-      if (zN < 0.9f) {                 // tune: 0.9 ~ within ~25°
-        okUpright = false;
-        break;
-      }
-    }
-
-    lastX = x; lastY = y; lastZ = z;
-    delay(50);
-  }
-  Serial.println();
-  Serial.print("Stability Check - ");
-  Serial.print("Mag OK: "); Serial.println(okMag);
-  Serial.print("Upright OK: "); Serial.println(okUpright);
-  float avgDelta = sumDelta / (STABILITY_SAMPLES - 1);
-  Serial.print("Avg Delta: "); Serial.print(avgDelta*1000.0f); Serial.print(" mg | ");
-  Serial.print("avgDelta < "); Serial.print(ACCEL_DEVIATION_THRESHOLD);
-  Serial.println(avgDelta < ACCEL_DEVIATION_THRESHOLD ? " TRUE" : " FALSE");
-  return okMag && okUpright && (avgDelta < ACCEL_DEVIATION_THRESHOLD);
-}
-
 // Load Cell Configuration
 HX711 loadcell;
 const float LOADCELL_CALIBRATION_FACTOR = 1.0; // Placeholder - needs calibration
 const float THRESHOLD_DRINK_AMOUNT = 5.0; // Minimum weight change (grams) to register a drink event
 float prevWeight = 0.0;
+
+// Loadcell stability results (updated by background task)
+volatile bool loadcellStable = false;
+volatile float loadcellLastWeight = 0.0f;
+
+// Thresholds for loadcell-based stability
+const int STABILITY_SAMPLES = 6;
+const float LOADCELL_BOTTOM_PLATE_THRESHOLD = 30.0f; // grams: weight of bottom plate/contact to consider "on table"
+const float LOADCELL_DEVIATION_THRESHOLD = 0.5f; // grams: max avg deviation to consider stable
 
 // BLE Objects
 BLEService coasterService(COASTER_SERVICE_UUID);
@@ -152,11 +96,92 @@ TimerHandle_t heartbeatTimer;
 
 TaskHandle_t ledAlertTaskHandle;
 TaskHandle_t ledFeedbackTaskHandle;
+TaskHandle_t loadcellStabilityTaskHandle;
 
 void heartbeatCallback(TimerHandle_t xTimer) {
-  Event evt;
-  evt.type = EventType::HEARTBEAT_TICK;
-  xQueueSend(eventQueue, &evt, 0);
+  (void)xTimer;
+  // Notify the loadcell stability task to perform the time-wise check.
+  // That task will enqueue the actual HEARTBEAT_TICK event after completing checks.
+  if (loadcellStabilityTaskHandle) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(loadcellStabilityTaskHandle, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  } else {
+    // Fallback: if task not ready, still send heartbeat event
+    Event evt;
+    evt.type = EventType::HEARTBEAT_TICK;
+    xQueueSend(eventQueue, &evt, 0);
+  }
+}
+
+float getWeight() {
+  // Check if load cell is ready
+  if (loadcell.is_ready()) {
+    // Get average of 10 readings (already calibrated by set_scale)
+    float weight = loadcell.get_units(10);
+    return weight;
+  } else {
+    Serial.println("Load cell not ready");
+    return NAN; // Return NaN to indicate error/unavailable
+  }
+}
+
+// Perform a stability check using the load cell. This does blocking sampling
+// and should be executed from the dedicated FreeRTOS task (not from ISRs).
+static bool performLoadcellStabilityCheck(float &outWeight) {
+  if (!loadcell.is_ready()) {
+    outWeight = NAN;
+    return false;
+  }
+
+  float x0 = getWeight();
+  if (isnan(x0)) { outWeight = NAN; return false; }
+  float last = x0;
+  float sumDelta = 0.0f;
+
+  for (int i = 1; i < STABILITY_SAMPLES; i++) {
+    delay(50);
+    float w = getWeight();
+    if (w < 0) { outWeight = -1.0f; return false; }
+    float d = fabsf(w - last);
+    sumDelta += d;
+    last = w;
+  }
+
+  float avgDelta = sumDelta / (STABILITY_SAMPLES - 1);
+  outWeight = last;
+
+  // Consider stable only when weight is positive and above the bottom-plate threshold (on-table)
+  // Negative readings (picked-up pull) are NOT considered stable.
+  bool magOk = (last >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
+  bool stable = magOk && (avgDelta <= LOADCELL_DEVIATION_THRESHOLD);
+
+  return stable;
+}
+
+// FreeRTOS task: waits for notification from heartbeat timer, performs the
+// loadcell stability sampling, updates cached state, then enqueues HEARTBEAT_TICK.
+void loadcellStabilityTask(void *pvParameters) {
+  (void)pvParameters;
+
+  for (;;) {
+    // Wait until heartbeat timer notifies us (vTaskNotifyGiveFromISR)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    float measuredWeight = -1.0f;
+    bool stable = performLoadcellStabilityCheck(measuredWeight);
+
+    // Update shared state
+    loadcellLastWeight = measuredWeight;
+    loadcellStable = stable;
+
+    // Enqueue heartbeat event for the main loop now that we have fresh loadcell data
+    Event evt;
+    evt.type = EventType::HEARTBEAT_TICK;
+    evt.timestamp = millis();
+    evt.value = (uint32_t)(measuredWeight >= 0 ? (uint32_t)measuredWeight : 0);
+    xQueueSend(eventQueue, &evt, 0);
+  }
 }
 
 bool isGlassPresent() {
@@ -169,72 +194,6 @@ bool isGlassPresent() {
   // In hysteresis zone, keep previous state. For the inital call, use middle of threshold as a binary state.
   static bool lastState = (val >= (THRESHOLD_HIGH + THRESHOLD_LOW) / 2);
   return lastState;
-}
-
-float getWeight() {
-  // Check if load cell is ready
-  if (loadcell.is_ready()) {
-    // Get average of 10 readings (already calibrated by set_scale)
-    float weight = loadcell.get_units(10);
-    return weight;
-  } else {
-    Serial.println("Load cell not ready");
-    return -1.0; // Return -1 to indicate error
-  }
-}
-
-// ISR for IMU wake-up interrupt (FreeRTOS-safe)
-void imuInterruptHandler() {
-  printf("IMU Interrupt Triggered\n");
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  Event motionEvt;
-  motionEvt.type = EventType::MOTION_DETECTED;
-  motionEvt.timestamp = millis();
-  // Send event to queue from ISR
-  if (eventQueue != NULL) {
-    xQueueSendFromISR(eventQueue, &motionEvt, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-  }
-}
-
-// Configure LSM6DS3TR-C wake-up interrupt
-void setupIMUWakeup() {
-  // Configure wake-up threshold (WK_THS register 0x5B)
-  // Bits [5:0] = threshold, 1 LSB = FS_XL/64
-  // At 2g full scale: 1 LSB = 2g/64 = 31.25mg
-  // Setting to 0x02 = ~62.5mg threshold
-  // imu.writeRegister(LSM6DS3_ACC_GYRO_TAP_CFG1, 0x);
-  imu.writeRegister(0x5B, 0x02);
-  
-  // Configure wake-up duration (WAKE_UP_DUR register 0x5C)
-  // WAKE_DUR[1:0] = duration in ODR cycles before wake-up
-  // Set to 0x00 for immediate wake-up
-  imu.writeRegister(0x5C, 0x00);
-  
-  // Enable wake-up interrupt on INT1 (MD1_CFG register 0x5E)
-  // Bit 5 (INT1_WU) = 1 to route wake-up to INT1
-  imu.writeRegister(0x5E, 0x20);
-  
-  // Enable interrupts (CTRL4_C register 0x13)
-  // Bit 4 (INT1_ON_INT1) = 1 to enable INT1 pin
-  uint8_t ctrl4c;
-  imu.readRegister(&ctrl4c, 0x13);
-  ctrl4c |= 0x10;
-  imu.writeRegister(0x13, ctrl4c);
-  
-  // Configure interrupt pin as input with pull-down
-  pinMode(IMU_INT1_PIN, INPUT_PULLDOWN);
-  
-  // Attach interrupt handler (rising edge)
-  attachInterrupt(digitalPinToInterrupt(IMU_INT1_PIN), imuInterruptHandler, RISING);
-  
-  Serial.println("IMU wake-up interrupt configured");
-}
-
-// Clear the wake-up interrupt source
-void clearIMUInterrupt() {
-  uint8_t wakeupSrc;
-  imu.readRegister(&wakeupSrc, 0x1B); // Read WAKE_UP_SRC to clear interrupt
 }
 
 // BLE Connection Callbacks
@@ -532,14 +491,12 @@ void ledFeedbackTask(void *pvParameters) {
 // Determine initial state based on glass presence and stability
 void determineInitialState() {
   bool glassPresent = isGlassPresent();
-  bool uprightStable = isStableGeneric(true);
-  bool stable = isStableGeneric(false);
-
-  if (glassPresent && uprightStable) {
+  // Use loadcell-based stability check (cached by background task)
+  if (glassPresent && loadcellStable) {
     currentState = DeviceState::IDLE_WITH_GLASS;
-  } else if (!glassPresent && stable) {
+  } else if (!glassPresent && loadcellStable) {
     currentState = DeviceState::IDLE_NO_GLASS;
-  } else if (glassPresent && !stable) {
+  } else if (glassPresent && !loadcellStable) {
     currentState = DeviceState::MOVING_WITH_GLASS;
   } else {
     currentState = DeviceState::MOVING_NO_GLASS;
@@ -583,20 +540,6 @@ void setup() {
 
   // Create a Queue that can hold 10 events (must exist before ISR runs)
   eventQueue = xQueueCreate(10, sizeof(Event));
-
-  // Initialize internal I2C bus for IMU (Wire1 on XIAO nRF52840 Sense)
-  Wire1.begin();
-  delay(10); // Allow I2C to stabilize
-
-  // Initialize accelerometer
-  if (imu.begin() != 0) {
-    Serial.println("Failed to initialize IMU!");
-  } else {
-    Serial.println("IMU initialized successfully");
-    // Setup wake-up interrupt after IMU is initialized
-    setupIMUWakeup();
-    clearIMUInterrupt(); // Clear any pending interrupts
-  }
   
   // Initialize load cell TODO: Uncomment when load cell is working
   loadcell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
@@ -620,11 +563,15 @@ void setup() {
   startBLEAdvertising();
 
   // Start with SLOW polling (Hibernation)
-  heartbeatTimer = xTimerCreate("Heartbeat", pdMS_TO_TICKS(SLOW_POLL_MS), pdTRUE, 0, heartbeatCallback);
-  xTimerStart(heartbeatTimer, 0);
-
+  // Create tasks that will be notified by the heartbeat timer.
   xTaskCreate(ledAlertTask, "LED Alert Task", 256, NULL, 1, &ledAlertTaskHandle);
   xTaskCreate(ledFeedbackTask, "LED Feedback Task", 256, NULL, 1, &ledFeedbackTaskHandle);
+  xTaskCreate(loadcellStabilityTask, "Loadcell Stability", 512, NULL, 2, &loadcellStabilityTaskHandle);
+
+  // Start with SLOW polling (Hibernation). The timer now notifies the loadcell task
+  // which will enqueue the HEARTBEAT_TICK after sampling.
+  heartbeatTimer = xTimerCreate("Heartbeat", pdMS_TO_TICKS(SLOW_POLL_MS), pdTRUE, 0, heartbeatCallback);
+  xTimerStart(heartbeatTimer, 0);
 
   // Disable when testing, TODO: Enable when ready
   // determineInitialState(); 
@@ -676,7 +623,7 @@ void loop() {
 
         else if (evt.type == EventType::CHECK_FOR_DRINK) {
           // Read weight from load cell
-          if (glassChanged) {
+            if (glassChanged) {
             // If glass state changed, reset previous weight
             prevWeight = getWeight();
             glassChanged = false;
@@ -685,8 +632,8 @@ void loop() {
             Serial.println(" g");
           } else {
             float weight = getWeight();
-            if (weight >= 0) {
-              float drinkAmount = prevWeight - weight;
+            if (!isnan(weight)) {
+              float drinkAmount = fabsf(prevWeight - weight);
               if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
                 totalConsumed += drinkAmount;
                 Serial.print("Drink detected: ");
@@ -696,7 +643,7 @@ void loop() {
                 // Update previous weight
                 prevWeight = weight;
 
-                // Send consumption event via BLE
+                // Send consumption event via BLE (send as positive grams)
                 sendConsumptionEvent(millis(), (uint32_t)drinkAmount);
               }
             }
@@ -712,7 +659,7 @@ void loop() {
             glassChanged = true;
           }
           float weight = getWeight();
-          if (weight >= 0) {
+          if (!isnan(weight)) {
             prevWeight = weight; // Update previous weight
           }
         }
@@ -745,13 +692,12 @@ void loop() {
         // Handle movement with glass
         Serial.println("State: MOVING_WITH_GLASS");
 
-        // One heartbeat: check accel for upright stable position and for glass removal
+        // One heartbeat: check loadcell for stable position and for glass removal
         if (evt.type == EventType::HEARTBEAT_TICK) {
           Event e;
           bool sendEvent = false;
-          bool isStableUpright = isStableGeneric(true);
-
-          if (isStableUpright && glassPresent) {
+            // Use loadcell stability instead of accelerometer upright check
+            if (loadcellStable && glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
             // Switch to a slower heartbear tick for idle state
@@ -760,7 +706,7 @@ void loop() {
             e.type = EventType::CHECK_FOR_DRINK;
             sendEvent = true;
           }
-          else if (isStableUpright && !glassPresent) {
+            else if (loadcellStable && !glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
             Serial.println("Transition to IDLE_NO_GLASS");
             // Switch to a slower heartbear tick for idle state
@@ -768,7 +714,7 @@ void loop() {
             
             glassChanged = true;
           }          
-          else if (!isStableUpright && !glassPresent) {
+            else if (!loadcellStable && !glassPresent) {
             currentState = DeviceState::MOVING_NO_GLASS;
             Serial.println("Transition to MOVING_NO_GLASS");
             
@@ -786,9 +732,10 @@ void loop() {
 
         // On heartbeat, check accel for any stable position and for glass placement
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          bool isDeviceStable = isStableGeneric(false);
-          
-          if (isDeviceStable && glassPresent) {
+            // Use loadcell stability cache instead of accel-based check
+            bool isDeviceStable = loadcellStable;
+
+            if (isDeviceStable && glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
             // Switch to a slower heartbear tick for idle state
@@ -816,31 +763,20 @@ void loop() {
         Serial.println("State: TEST");
         
         if (evt.type == EventType::HEARTBEAT_TICK) {          
-          // Test isUprightStable function
-          bool isUpright = isStableGeneric(true);
-          // Test isStable (any orientation)
-          bool isAnyStable = isStableGeneric(false);
-          
-          // Test load cell
-          float weight = getWeight();
+          // Loadcell cached stability
+          bool isAnyStable = loadcellStable;
+          float weight = loadcellLastWeight;
           /*
           // Test hall sensor
           int hallValue = analogRead(HALL_SENSOR_PIN);
           bool glassPresent = isGlassPresent();*/
 
           // Print all values to serial monitor
-          Serial.print(" | Upright+Stable: ");
-          Serial.print(isUpright ? "YES" : "NO");
-          Serial.print(" | Stable(any): ");
-          Serial.println(isAnyStable ? "YES" : "NO");
-          
-          Serial.print("Load Cell Weight: ");
-          if (1) {
-            Serial.print(weight, 2);
-            Serial.println(" units");
-          } else {
-            Serial.println("ERROR");
-          }
+          Serial.print(" | Loadcell Stable: ");
+          Serial.print(isAnyStable ? "YES" : "NO");
+          Serial.print(" | Loadcell Weight: ");
+          Serial.print(weight, 2);
+          Serial.println(" g");
           /*
           Serial.print("Hall Sensor: ");
           Serial.print(hallValue);
@@ -866,7 +802,6 @@ void loop() {
 
         else if (evt.type == EventType::MOTION_DETECTED) {
           Serial.println("Motion Detected Event Received");
-          clearIMUInterrupt(); // Clear interrupt source
         }
         
         // BLE Test: Handle commands in TEST mode
