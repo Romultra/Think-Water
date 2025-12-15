@@ -1,7 +1,7 @@
 [wokwi]
 version = 1
-firmware = '.pio/build/coaster-main/firmware.bin'
-elf = '.pio/build/coaster-main/firmware.elf'
+firmware = '.pio/build/base-main/firmware.bin'
+elf = '.pio/build/base-main/firmware.elf'
 
 # Forward http://localhost:8180 to port 80 on the simulated ESP32:
 [[net.forward]]
