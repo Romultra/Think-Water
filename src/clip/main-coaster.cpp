@@ -55,6 +55,13 @@ BLECharacteristic goalChar(GOAL_CHAR_UUID);
 bool bleConnected = false;
 volatile bool dataPendingToSend = false;
 int32_t lastConsumptionValue = 0;  // Scaled by 100 (e.g., 1550 = 15.50g)
+
+// Manufacturer data for advertising (Company ID 0xFFFF + 1-byte data pending flag)
+uint8_t mfgData[3] = {0xFF, 0xFF, 0x00};
+
+// Forward declaration for advertising update function
+void updateAdvertisingData(bool hasPendingData);
+
 bool glassChanged = false;
 float hydrationGoal = 2000.0; // Default 2000ml
 float totalConsumed = 0.0;
@@ -213,13 +220,15 @@ void connect_callback(uint16_t conn_handle) {
 void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   Serial.print("Disconnected, reason = 0x");
   Serial.println(reason, HEX);
-  
+
   bleConnected = false;
-  
-  // If we still have data to send, restart advertising
+
+  // Always restart advertising after disconnect, with appropriate data pending flag
+  updateAdvertisingData(dataPendingToSend);
   if (dataPendingToSend) {
-    Bluefruit.Advertising.start(0); // Advertise indefinitely until connected
     Serial.println("Restarting advertising (data pending)");
+  } else {
+    Serial.println("Restarting advertising (available for commands)");
   }
 }
 
@@ -252,6 +261,25 @@ void goal_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* dat
     Serial.print(hydrationGoal);
     Serial.println(" ml");
   }
+}
+
+// Update advertising data with current data pending flag
+// This allows the base station to know if the coaster has data to send
+void updateAdvertisingData(bool hasPendingData) {
+  Bluefruit.Advertising.stop();
+  Bluefruit.Advertising.clearData();
+
+  // Update manufacturer data flag
+  mfgData[2] = hasPendingData ? 0x01 : 0x00;
+
+  // Re-add all advertising data
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addService(coasterService);
+  Bluefruit.Advertising.addManufacturerData(mfgData, sizeof(mfgData));
+  Bluefruit.Advertising.addName();
+
+  Bluefruit.Advertising.start(0);
 }
 
 // Setup BLE
@@ -292,6 +320,7 @@ void setupBLE() {
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(coasterService);
+  Bluefruit.Advertising.addManufacturerData(mfgData, sizeof(mfgData));  // Data pending flag
   Bluefruit.Advertising.addName();
   
   // Set advertising interval (units of 0.625ms)
@@ -322,29 +351,31 @@ void stopBLEAdvertising() {
 // value is scaled by 100 (e.g., 1550 = 15.50g)
 bool sendConsumptionEvent(uint32_t timestamp, int32_t value) {
   if (!bleConnected) {
-    // Not connected, mark data as pending and start advertising
+    // Not connected, mark data as pending and update advertising to signal base
     dataPendingToSend = true;
     lastConsumptionValue = value;
-    startBLEAdvertising();
-    Serial.println("Not connected - advertising to send data");
+    updateAdvertisingData(true);  // Signal that we have data to send
+    Serial.println("Not connected - advertising with data pending flag");
     return false;
   }
-  
+
   // Pack data: timestamp(4 bytes) + value(4 bytes, signed)
   uint8_t data[8];
   memcpy(data, &timestamp, 4);
   memcpy(data + 4, &value, 4);
-  
+
   if (consumptionChar.notify(data, sizeof(data))) {
     Serial.println("Consumption event sent via BLE");
     dataPendingToSend = false;
-    
+    updateAdvertisingData(false);  // Clear the data pending flag
+
     // Disconnect after sending to save power
     // The base station will disconnect, or we can request it
     return true;
   } else {
     Serial.println("Failed to send consumption event");
     dataPendingToSend = true;
+    updateAdvertisingData(true);  // Ensure flag is set on failure
     return false;
   }
 }
