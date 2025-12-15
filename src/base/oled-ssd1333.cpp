@@ -60,51 +60,89 @@ void SSD1333::hardwareReset() {
 void SSD1333::initSequence() {
     spiBegin();
 
+    // Unlock driver IC
     writeCommand(SSD1333_CMD_SET_LOCK);
     writeData(0x12);
 
+    // Display OFF
     writeCommand(SSD1333_CMD_DISPLAY_OFF);
 
-    writeCommand(SSD1333_CMD_SET_CLK_DIV);
-    writeData(0xD1);
+    // Set Remap/Color Depth
+    // A[0]=0: Horizontal address increment
+    // A[1]=1: Column address remap (flip horizontal)
+    // A[2]=1: Color sequence A->B->C
+    // A[5]=1: Enable COM Split Odd Even
+    // A[7:6]=01: 65k color
+    writeCommand(SSD1333_CMD_SET_REMAP);
+    writeData(0x66);
 
-    writeCommand(SSD1333_CMD_SET_MUX_RATIO);
-    writeData(0xAF);
-
-    writeCommand(SSD1333_CMD_SET_OFFSET);
-    writeData(0x30);
-
+    // Display Start Line = 0
     writeCommand(SSD1333_CMD_SET_START_LINE);
     writeData(0x00);
 
-    writeCommand(SSD1333_CMD_SET_REMAP);
-    writeData(0x74);
+    // Display Offset = 0 (was incorrectly 0x30)
+    writeCommand(SSD1333_CMD_SET_OFFSET);
+    writeData(0x00);
 
-    writeCommand(SSD1333_CMD_SET_MASTER_CFG);
-    writeData(0x8E);
+    // Normal Display Mode
+    writeCommand(SSD1333_CMD_NORMAL_DISPLAY);
 
-    writeCommand(SSD1333_CMD_CONTRAST_A);
-    writeData(0x64);
+    // Phase 1 & 2 period (0x24 per NHD datasheet)
+    // Phase 1 = 4 (8 DCLKs), Phase 2 = 2 (4 DCLKs)
+    writeCommand(SSD1333_CMD_SET_PRECHARGE);
+    writeData(0x24);
 
-    writeCommand(SSD1333_CMD_CONTRAST_B);
-    writeData(0x78);
+    // Clock Divider / Oscillator Frequency (0x80 per NHD datasheet)
+    // Divide by 1, oscillator at level 8
+    writeCommand(SSD1333_CMD_SET_CLK_DIV);
+    writeData(0x80);
 
-    writeCommand(SSD1333_CMD_CONTRAST_C);
-    writeData(0x64);
-
-    writeCommand(SSD1333_CMD_MASTER_CURRENT);
+    // Second Pre-charge Period (was missing!)
+    writeCommand(SSD1333_CMD_SET_PRECHARGE2);
     writeData(0x0F);
 
-    writeCommand(SSD1333_CMD_SET_PRECHARGE);
-    writeData(0x22);
-
+    // Pre-charge Voltage Level = 0.40*VCC
     writeCommand(SSD1333_CMD_SET_PRECHARGE_V);
     writeData(0x1F);
 
+    // VCOMH Deselect Level = 0.82*VCC
     writeCommand(SSD1333_CMD_SET_VCOMH);
     writeData(0x05);
 
-    writeCommand(SSD1333_CMD_NORMAL_DISPLAY);
+    // Contrast for Color A, B, C (per NHD datasheet)
+    writeCommand(SSD1333_CMD_CONTRAST_A);
+    writeData(0x3C);
+    writeCommand(SSD1333_CMD_CONTRAST_B);
+    writeData(0x39);
+    writeCommand(SSD1333_CMD_CONTRAST_C);
+    writeData(0x43);
+
+    // Master Current Control (no change)
+    writeCommand(SSD1333_CMD_MASTER_CURRENT);
+    writeData(0x0F);
+
+    // MUX Ratio = 176 (0xAF = 175, so 176 MUX)
+    writeCommand(SSD1333_CMD_SET_MUX_RATIO);
+    writeData(0xAF);
+
+    // Gamma Look-Up Table (required for proper grayscale)
+    writeCommand(SSD1333_CMD_SET_GRAY_LUT);
+    // GS1-GS63 values from NHD datasheet example
+    static const uint8_t gamma_lut[] = {
+        0x00, 0x02, 0x04, 0x06, 0x07, 0x08, 0x09, 0x0A,  // GS1-8
+        0x0B, 0x0C, 0x0D, 0x0E, 0x10, 0x11, 0x12, 0x14,  // GS9-16
+        0x15, 0x16, 0x18, 0x1A, 0x1B, 0x1D, 0x1F, 0x20,  // GS17-24
+        0x22, 0x24, 0x26, 0x27, 0x29, 0x2B, 0x2D, 0x2F,  // GS25-32
+        0x31, 0x33, 0x35, 0x37, 0x39, 0x3B, 0x3D, 0x3F,  // GS33-40
+        0x42, 0x44, 0x46, 0x48, 0x4B, 0x4D, 0x50, 0x52,  // GS41-48
+        0x55, 0x57, 0x5A, 0x5B, 0x5F, 0x62, 0x65, 0x67,  // GS49-56
+        0x6A, 0x6D, 0x70, 0x73, 0x76, 0x79, 0x7C         // GS57-63
+    };
+    for (int i = 0; i < 63; i++) {
+        writeData(gamma_lut[i]);
+    }
+
+    // Display ON
     writeCommand(SSD1333_CMD_DISPLAY_ON);
 
     spiEnd();
