@@ -10,6 +10,7 @@
 #include <BLEClient.h>
 #include <BLEScan.h>
 #include "Adafruit_SHT4x.h"
+#include "RTClib.h"
 
 // External water turnover prediction function
 extern float predictWaterTurnoverCH(
@@ -117,9 +118,9 @@ enum class BLEState {
 // Global State
 // ============================================================================
 
-// Time management
-uint32_t bootTimestamp = 0;           // Unix timestamp when device booted (set via serial)
-bool timeSet = false;                 // Whether time has been set
+// RTC (HW-111 module with DS1307)
+RTC_DS1307 rtc;
+bool rtcInitialized = false;          // Whether RTC is available and running
 uint8_t lastKnownDay = 0;             // For detecting day changes
 
 // Sensor management
@@ -162,6 +163,7 @@ ConsumptionEvent latestConsumption = {0, 0, 0.0f};
 // ============================================================================
 // Forward Declarations
 // ============================================================================
+void initRTC();
 void initSensor();
 void initSD();
 void initBLE();
@@ -188,7 +190,8 @@ uint8_t getHourOfDay();
 float getDayProgress();
 bool isNewDay();
 void onNewDay();
-void checkSerialTimeSync();
+void checkSerialCommands();
+void printCurrentTime();
 
 // ============================================================================
 // BLE Callbacks
@@ -276,22 +279,44 @@ class MyScanCallbacks : public BLEAdvertisedDeviceCallbacks {
 };
 
 // ============================================================================
-// Time Management Functions
+// RTC Functions (HW-111 / DS1307)
 // ============================================================================
 
+void initRTC() {
+    // Note: Wire.begin() is called in initSensor(), RTC shares the I2C bus
+    if (rtc.begin()) {
+        rtcInitialized = true;
+
+        if (!rtc.isrunning()) {
+            Serial.println("RTC is NOT running! Setting to compile time...");
+            // Set RTC to the date & time this sketch was compiled
+            rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+        }
+
+        DateTime now = rtc.now();
+        lastKnownDay = now.day();
+
+        Serial.println("RTC (DS1307) initialized");
+        printCurrentTime();
+    } else {
+        Serial.println("ERROR: RTC (DS1307) not found!");
+        Serial.println("Check I2C connections (SDA=21, SCL=22)");
+        rtcInitialized = false;
+    }
+}
+
 uint32_t getCurrentTimestamp() {
-    if (!timeSet) {
+    if (!rtcInitialized) {
         return millis() / 1000;  // Fall back to seconds since boot
     }
-    return bootTimestamp + (millis() / 1000);
+    return rtc.now().unixtime();
 }
 
 uint8_t getHourOfDay() {
-    if (!timeSet) {
-        return 12;  // Default to noon if time not set
+    if (!rtcInitialized) {
+        return 12;  // Default to noon if RTC not available
     }
-    uint32_t timestamp = getCurrentTimestamp();
-    return (timestamp % 86400) / 3600;  // Seconds in day / seconds in hour
+    return rtc.now().hour();
 }
 
 float getDayProgress() {
@@ -302,9 +327,11 @@ float getDayProgress() {
 }
 
 bool isNewDay() {
-    if (!timeSet) return false;
-    uint32_t timestamp = getCurrentTimestamp();
-    uint8_t currentDay = (timestamp / 86400) % 31;  // Simplified day tracking
+    if (!rtcInitialized) return false;
+
+    DateTime now = rtc.now();
+    uint8_t currentDay = now.day();
+
     if (currentDay != lastKnownDay) {
         lastKnownDay = currentDay;
         return true;
@@ -312,27 +339,101 @@ bool isNewDay() {
     return false;
 }
 
-void checkSerialTimeSync() {
-    // Check for time sync command: "TIME:<unix_timestamp>"
-    if (Serial.available() > 5) {
-        String input = Serial.readStringUntil('\n');
-        input.trim();
-        if (input.startsWith("TIME:")) {
-            String timestampStr = input.substring(5);
-            uint32_t timestamp = timestampStr.toInt();
-            if (timestamp > 1700000000) {  // Reasonable Unix timestamp (after 2023)
-                bootTimestamp = timestamp - (millis() / 1000);
-                timeSet = true;
-                lastKnownDay = (timestamp / 86400) % 31;
+void printCurrentTime() {
+    if (!rtcInitialized) {
+        Serial.println("RTC not available");
+        return;
+    }
+
+    DateTime now = rtc.now();
+
+    Serial.println("----------------------------------------");
+    Serial.print("Current time: ");
+    Serial.print(now.year(), DEC);
+    Serial.print('/');
+    if (now.month() < 10) Serial.print('0');
+    Serial.print(now.month(), DEC);
+    Serial.print('/');
+    if (now.day() < 10) Serial.print('0');
+    Serial.print(now.day(), DEC);
+    Serial.print(" ");
+    if (now.hour() < 10) Serial.print('0');
+    Serial.print(now.hour(), DEC);
+    Serial.print(':');
+    if (now.minute() < 10) Serial.print('0');
+    Serial.print(now.minute(), DEC);
+    Serial.print(':');
+    if (now.second() < 10) Serial.print('0');
+    Serial.println(now.second(), DEC);
+    Serial.print("Unix timestamp: ");
+    Serial.println(now.unixtime());
+    Serial.println("----------------------------------------");
+}
+
+void checkSerialCommands() {
+    if (!Serial.available()) return;
+
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input.length() == 0) return;
+
+    // TIME:<unix_timestamp> - Set RTC time from Unix timestamp
+    if (input.startsWith("TIME:")) {
+        String timestampStr = input.substring(5);
+        uint32_t timestamp = timestampStr.toInt();
+
+        if (timestamp > 1700000000) {  // Reasonable Unix timestamp (after 2023)
+            if (rtcInitialized) {
+                rtc.adjust(DateTime(timestamp));
+                lastKnownDay = rtc.now().day();
 
                 Serial.println("========================================");
-                Serial.print("Time synchronized! Unix timestamp: ");
-                Serial.println(timestamp);
-                Serial.print("Current hour: ");
-                Serial.println(getHourOfDay());
+                Serial.println("RTC time updated!");
+                printCurrentTime();
                 Serial.println("========================================");
+            } else {
+                Serial.println("ERROR: RTC not initialized!");
             }
+        } else {
+            Serial.println("Invalid timestamp. Use Unix timestamp > 1700000000");
         }
+    }
+    // SETTIME:YYYY,MM,DD,HH,MM,SS - Set RTC time from components
+    else if (input.startsWith("SETTIME:")) {
+        String params = input.substring(8);
+        int year, month, day, hour, minute, second;
+
+        if (sscanf(params.c_str(), "%d,%d,%d,%d,%d,%d",
+                   &year, &month, &day, &hour, &minute, &second) == 6) {
+            if (rtcInitialized) {
+                rtc.adjust(DateTime(year, month, day, hour, minute, second));
+                lastKnownDay = day;
+
+                Serial.println("========================================");
+                Serial.println("RTC time updated!");
+                printCurrentTime();
+                Serial.println("========================================");
+            } else {
+                Serial.println("ERROR: RTC not initialized!");
+            }
+        } else {
+            Serial.println("Invalid format. Use: SETTIME:YYYY,MM,DD,HH,MM,SS");
+        }
+    }
+    // T or TIME - Print current time
+    else if (input.equalsIgnoreCase("T") || input.equalsIgnoreCase("TIME")) {
+        printCurrentTime();
+    }
+    // H or HELP - Show help
+    else if (input.equalsIgnoreCase("H") || input.equalsIgnoreCase("HELP")) {
+        Serial.println("\n========================================");
+        Serial.println("Serial Commands:");
+        Serial.println("  TIME:<unix>         Set time from Unix timestamp");
+        Serial.println("  SETTIME:Y,M,D,H,M,S Set time from components");
+        Serial.println("  T or TIME           Print current time");
+        Serial.println("  H or HELP           Show this help");
+        Serial.println("========================================\n");
     }
 }
 
@@ -461,7 +562,7 @@ void logConsumptionEvent(const ConsumptionEvent& event) {
 }
 
 float loadTodayConsumption() {
-    if (!sdInitialized || !timeSet) return 0.0f;
+    if (!sdInitialized || !rtcInitialized) return 0.0f;
 
     // Calculate today's start timestamp (midnight)
     uint32_t now = getCurrentTimestamp();
@@ -827,12 +928,14 @@ void setup() {
     delay(1000);
 
     Serial.println("\n========================================");
-    Serial.println("  Coaster-Clip Base Station v1.0");
+    Serial.println("  Coaster-Clip Base Station v1.1");
+    Serial.println("  (with HW-111 RTC module)");
     Serial.println("========================================\n");
 
     // Initialize hardware
     initBuzzer();
-    initSensor();
+    initSensor();    // Initializes I2C (Wire)
+    initRTC();       // RTC shares I2C bus with SHT41
     initSD();
     initBLE();
 
@@ -853,8 +956,11 @@ void setup() {
 
     Serial.println("\n========================================");
     Serial.println("Setup complete!");
-    Serial.println("Send TIME:<unix_timestamp> to set time");
-    Serial.println("Example: TIME:1702636800");
+    if (!rtcInitialized) {
+        Serial.println("WARNING: RTC not available!");
+        Serial.println("Time functions will be limited.");
+    }
+    Serial.println("Serial commands: H for help");
     Serial.println("========================================\n");
 
     // Start first scan
@@ -862,8 +968,8 @@ void setup() {
 }
 
 void loop() {
-    // Check for serial time sync
-    checkSerialTimeSync();
+    // Check for serial commands (time setting, etc.)
+    checkSerialCommands();
 
     // Handle day transitions
     if (isNewDay()) {
@@ -909,8 +1015,8 @@ void loop() {
         Serial.println(" mL");
     }
 
-    // Queue goal if not yet sent and time is set
-    if (timeSet && !hydrationState.goalSentToCoaster && hydrationState.dailyGoalML <= 0) {
+    // Queue goal if not yet sent and RTC is available
+    if (rtcInitialized && !hydrationState.goalSentToCoaster && hydrationState.dailyGoalML <= 0) {
         hydrationState.dailyGoalML = calculateDailyGoal();
         pendingGoal = hydrationState.dailyGoalML;
         goalPending = true;
