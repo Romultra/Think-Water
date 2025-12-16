@@ -563,8 +563,8 @@ void determineInitialState() {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { delay(10); } // TODO: Remove for production
-  delay(500);
+  //while (!Serial) { delay(10); } // TODO: Remove for production
+  //delay(500);
 
   // Configure battery charging current to 100mA
   pinMode(22, OUTPUT);
