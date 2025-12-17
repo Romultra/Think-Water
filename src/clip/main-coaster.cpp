@@ -40,8 +40,10 @@ float prevWeight = NAN; // NAN until first valid measurement
 // slightly stale or partially-read float values don't compromise safety (worst case:
 // one incorrect stability reading). For critical applications, use FreeRTOS mutexes
 // or atomic types. The loadcellStabilityTask writes, main loop reads.
-volatile bool loadcellStable = false;
+volatile bool loadcellStable = false;        // Full stability (magnitude + deviation)
+volatile bool loadcellMagnitudeOk = false;   // Quick magnitude check (on table)
 volatile float loadcellLastWeight = 0.0f;
+volatile bool fastPeriodActive = false;      // Track timer period for stability task
 
 // Thresholds for loadcell-based stability
 const int STABILITY_SAMPLES = 6;
@@ -150,66 +152,102 @@ float getWeight() {
     return NAN; // Return NaN to indicate error/unavailable
   }
 
-  // Get average of 2 readings (already calibrated by set_scale)
-  float weight = loadcell.get_units(2);
+  // Get weight in grams
+  float weight = loadcell.get_units();
   return weight;
 }
 
-// Perform a stability check using the load cell. This does blocking sampling
-// and should be executed from the dedicated FreeRTOS task (not from ISRs).
-// Uses raw readings for deviation check (more precision) and grams for magnitude check.
-static bool performLoadcellStabilityCheck(float &outWeight) {
-  if (!loadcell.is_ready()) {
-    outWeight = NAN;
+// Quick magnitude check - single reading to see if coaster is on table.
+// Fast enough for high-frequency polling during MOVING states.
+static bool performQuickMagnitudeCheck(float &outWeight) {
+  float weight = getWeight();
+  if (isnan(weight)) { outWeight = NAN; return false; }
+  outWeight = weight;
+
+  bool magOk = (weight >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
+
+  Serial.print("MagCheck: weight=");
+  Serial.print(weight, 1);
+  Serial.print("g magOk=");
+  Serial.println(magOk ? "YES" : "NO");
+
+  return magOk;
+}
+
+// Full stability check with deviation sampling. Takes multiple readings to
+// detect water sloshing. Only call when magnitude already passes (on table).
+// Should be executed from the dedicated FreeRTOS task (not from ISRs).
+static bool performDeviationCheck(float &outWeight) {
+  // First do magnitude check
+  float weight = getWeight();
+  if (isnan(weight)) { outWeight = NAN; return false; }
+  outWeight = weight;
+
+  bool magOk = (weight >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
+  if (!magOk) {
+    Serial.print("Stability: weight=");
+    Serial.print(weight, 1);
+    Serial.println("g magOk=NO");
     return false;
   }
 
-  // Get first raw reading
+  // Magnitude OK - sample for deviation
   long rawLast = getRawReading();
-  if (rawLast == LONG_MIN) { outWeight = NAN; return false; }
+  if (rawLast == LONG_MIN) { return false; }
   long rawSumDelta = 0;
 
-  // Sample raw readings for deviation check
   for (int i = 1; i < STABILITY_SAMPLES; i++) {
-    vTaskDelay(pdMS_TO_TICKS(50));
     long rawNow = getRawReading();
-    if (rawNow == LONG_MIN) { outWeight = NAN; return false; }
+    if (rawNow == LONG_MIN) { return false; }
     rawSumDelta += labs(rawNow - rawLast);
     rawLast = rawNow;
   }
 
   long avgRawDelta = rawSumDelta / (STABILITY_SAMPLES - 1);
-  Serial.print("Avg Raw Delta: ");
-  Serial.println(avgRawDelta);
-
-  // Get calibrated weight for magnitude check and output
-  float weight = getWeight();
-  if (isnan(weight)) { outWeight = NAN; return false; }
-  outWeight = weight;
-
-  // Magnitude check in grams: must be above threshold (on-table)
-  bool magOk = (weight >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
-  // Deviation check in raw units: more precision for stability detection
   bool deviationOk = (avgRawDelta <= LOADCELL_RAW_DEVIATION_THRESHOLD);
-  bool stable = magOk && deviationOk;
 
-  return stable;
+  Serial.print("Stability: delta=");
+  Serial.print(avgRawDelta);
+  Serial.print(" weight=");
+  Serial.print(weight, 1);
+  Serial.print("g devOk=");
+  Serial.print(deviationOk ? "YES" : "NO");
+  Serial.print(" stable=");
+  Serial.println(deviationOk ? "YES" : "NO");
+
+  return deviationOk;
 }
 
 // FreeRTOS task: waits for notification from heartbeat timer, performs the
 // loadcell stability sampling, updates cached state, then enqueues HEARTBEAT_TICK.
+// Check type depends on timer period:
+// - Fast period: quick magnitude check only (coaster in air detection)
+// - Slow period: full deviation check (water settling detection)
 void loadcellStabilityTask(void *pvParameters) {
   (void)pvParameters;
 
   for (;;) {
-    // Wait until heartbeat timer notifies us (vTaskNotifyGiveFromISR)
+    // Wait until heartbeat timer notifies us
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     float measuredWeight = -1.0f;
-    bool stable = performLoadcellStabilityCheck(measuredWeight);
+    bool magOk = false;
+    bool stable = false;
+
+    if (fastPeriodActive) {
+      // Fast period: quick magnitude check only
+      magOk = performQuickMagnitudeCheck(measuredWeight);
+      // Can't be stable without full deviation check
+      stable = false;
+    } else {
+      // Slow period: full stability check with deviation sampling
+      stable = performDeviationCheck(measuredWeight);
+      magOk = (measuredWeight >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
+    }
 
     // Update shared state
     loadcellLastWeight = measuredWeight;
+    loadcellMagnitudeOk = magOk;
     loadcellStable = stable;
 
     // Enqueue heartbeat event for the main loop now that we have fresh loadcell data
@@ -772,6 +810,7 @@ void loop() {
             Serial.println("Transition to MOVING_WITH_GLASS");
             // Switch to faster heartbeat tick for active state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+            fastPeriodActive = true;
 
             // Give feedback on progress towards hydration goal when glass is picked up
             xTaskNotifyGive(ledFeedbackTaskHandle);
@@ -802,6 +841,7 @@ void loop() {
             Serial.println("Transition to MOVING_NO_GLASS");
             // Switch to faster heartbeat tick for active state
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+            fastPeriodActive = true;
           } else if (glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
@@ -813,62 +853,102 @@ void loop() {
       
       case DeviceState::MOVING_WITH_GLASS:
         // Handle movement with glass
+        // Two-phase approach:
+        // - Fast period: quick magnitude check (is coaster on table?)
+        // - Slow period: full deviation check (is water settled?)
         Serial.println("State: MOVING_WITH_GLASS");
 
-        // On heartbeat: check loadcell for stable position and for glass removal
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          // Use loadcell stability instead of accelerometer upright check
-          if (loadcellStable && glassPresent) {
-            currentState = DeviceState::IDLE_WITH_GLASS;
-            Serial.println("Transition to IDLE_WITH_GLASS");
-            // Switch to a slower heartbeat tick for idle state
-            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+          if (fastPeriodActive) {
+            // Fast period: only magnitude check was performed
+            if (loadcellMagnitudeOk) {
+              // Coaster landed on table - switch to slow period for deviation check
+              Serial.println("Magnitude OK - switching to slow period for deviation check");
+              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+              fastPeriodActive = false;
+              // Stay in MOVING_WITH_GLASS until deviation check passes
+            } else if (!glassPresent) {
+              currentState = DeviceState::MOVING_NO_GLASS;
+              Serial.println("Transition to MOVING_NO_GLASS");
+              glassChanged = true;
+            }
+            // else: still in air, stay in fast period
+          } else {
+            // Slow period: full stability check was performed
+            if (loadcellStable && glassPresent) {
+              currentState = DeviceState::IDLE_WITH_GLASS;
+              Serial.println("Transition to IDLE_WITH_GLASS");
+              // Already on slow period
 
-            // Queue CHECK_FOR_DRINK event
-            Event e;
-            e.type = EventType::CHECK_FOR_DRINK;
-            e.timestamp = millis();
-            e.value = 0;
-            xQueueSend(eventQueue, &e, 0);
-          } else if (loadcellStable && !glassPresent) {
-            currentState = DeviceState::IDLE_NO_GLASS;
-            Serial.println("Transition to IDLE_NO_GLASS");
-            // Switch to a slower heartbeat tick for idle state
-            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-
-            glassChanged = true;
-          } else if (!loadcellStable && !glassPresent) {
-            currentState = DeviceState::MOVING_NO_GLASS;
-            Serial.println("Transition to MOVING_NO_GLASS");
-
-            glassChanged = true;
+              // Queue CHECK_FOR_DRINK event
+              Event e;
+              e.type = EventType::CHECK_FOR_DRINK;
+              e.timestamp = millis();
+              e.value = 0;
+              xQueueSend(eventQueue, &e, 0);
+            } else if (loadcellStable && !glassPresent) {
+              currentState = DeviceState::IDLE_NO_GLASS;
+              Serial.println("Transition to IDLE_NO_GLASS");
+              // Already on slow period
+              glassChanged = true;
+            } else if (!loadcellMagnitudeOk) {
+              // Coaster picked up again - back to fast period
+              Serial.println("Magnitude failed - switching back to fast period");
+              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+              fastPeriodActive = true;
+              if (!glassPresent) {
+                currentState = DeviceState::MOVING_NO_GLASS;
+                Serial.println("Transition to MOVING_NO_GLASS");
+                glassChanged = true;
+              }
+            }
+            // else: deviation check failed but magnitude OK (water sloshing) - stay in slow period, retry
           }
         }
         break;
       
       case DeviceState::MOVING_NO_GLASS:
         // Handle movement without glass
+        // Two-phase approach (same as MOVING_WITH_GLASS)
         Serial.println("State: MOVING_NO_GLASS");
 
-        // On heartbeat, check loadcell for stable position and for glass placement
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          if (loadcellStable && glassPresent) {
-            currentState = DeviceState::IDLE_WITH_GLASS;
-            Serial.println("Transition to IDLE_WITH_GLASS");
-            // Switch to a slower heartbeat tick for idle state
-            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-
-            glassChanged = true;
-          } else if (loadcellStable && !glassPresent) {
-            currentState = DeviceState::IDLE_NO_GLASS;
-            Serial.println("Transition to IDLE_NO_GLASS");
-            // Switch to a slower heartbeat tick for idle state
-            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-          } else if (!loadcellStable && glassPresent) {
-            currentState = DeviceState::MOVING_WITH_GLASS;
-            Serial.println("Transition to MOVING_WITH_GLASS");
-
-            glassChanged = true;
+          if (fastPeriodActive) {
+            // Fast period: only magnitude check was performed
+            if (loadcellMagnitudeOk) {
+              // Coaster landed on table - switch to slow period for deviation check
+              Serial.println("Magnitude OK - switching to slow period for deviation check");
+              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+              fastPeriodActive = false;
+            } else if (glassPresent) {
+              currentState = DeviceState::MOVING_WITH_GLASS;
+              Serial.println("Transition to MOVING_WITH_GLASS");
+              glassChanged = true;
+            }
+            // else: still in air, stay in fast period
+          } else {
+            // Slow period: full stability check was performed
+            if (loadcellStable && glassPresent) {
+              currentState = DeviceState::IDLE_WITH_GLASS;
+              Serial.println("Transition to IDLE_WITH_GLASS");
+              // Already on slow period
+              glassChanged = true;
+            } else if (loadcellStable && !glassPresent) {
+              currentState = DeviceState::IDLE_NO_GLASS;
+              Serial.println("Transition to IDLE_NO_GLASS");
+              // Already on slow period
+            } else if (!loadcellMagnitudeOk) {
+              // Coaster picked up again - back to fast period
+              Serial.println("Magnitude failed - switching back to fast period");
+              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+              fastPeriodActive = true;
+              if (glassPresent) {
+                currentState = DeviceState::MOVING_WITH_GLASS;
+                Serial.println("Transition to MOVING_WITH_GLASS");
+                glassChanged = true;
+              }
+            }
+            // else: deviation check failed but magnitude OK - stay in slow period, retry
           }
         }
         break;
