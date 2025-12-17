@@ -13,6 +13,13 @@
 #include "RTClib.h"
 #include "oled-ssd1333.h"
 
+// Nice TrueType fonts for better rendering at large sizes
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSans12pt7b.h>
+#include <Fonts/FreeSans9pt7b.h>
+
 // External water turnover prediction function
 extern float predictWaterTurnoverCH(
     float bodyWeightKg,
@@ -191,15 +198,40 @@ bool displayInitialized = false;
 
 // UI State
 Screen currentScreen = Screen::SETUP_AGE;
+Screen lastScreen = Screen::SETUP_AGE;
 MenuOption selectedMenuOption = MenuOption::BACK_TO_MAIN;
 DebugOption selectedDebugOption = DebugOption::BACK_TO_MENU;
-UserConfig userConfig = {35, 1, 70, false, false};
+UserConfig userConfig = {35, 0, 70, false, false};  // age, sex (0=female), weight, setupComplete, timeSet
 EncoderState encoder = {0, 0, 0, false, false, 0, 0, HIGH, HIGH};
 uint32_t lastDisplayUpdate = 0;
 uint32_t lastActivity = 0;
 bool screenSaverActive = false;
 uint8_t setupHour = 12;      // For time setup screens
 uint8_t setupMinute = 0;     // For time setup screens
+
+// Display optimization - track previous values to avoid unnecessary redraws
+struct DisplayCache {
+    float lastProgress;
+    float lastConsumed;
+    float lastGoal;
+    float lastTemp;
+    float lastHumidity;
+    uint8_t lastHour;
+    uint8_t lastMinute;
+    bool initialized;
+};
+DisplayCache displayCache = {0, 0, 0, 0, 0, 0, 0, false};
+
+// Setup screen cache
+struct SetupCache {
+    uint8_t lastAge;
+    uint8_t lastSex;
+    uint8_t lastWeight;
+    uint8_t lastSetupHour;
+    uint8_t lastSetupMinute;
+    bool initialized;
+};
+SetupCache setupCache = {0, 0, 0, 0, 0, false};
 
 // Sensor data
 SensorBuffer sensorBuffer = {{}, 0, 0};
@@ -378,12 +410,22 @@ void initDisplay() {
 
         // Show splash screen
         display.fillScreen(COLOR_BLACK);
-        display.setTextSize(2);
         display.setTextColor(RGB565(100, 200, 255));
-        display.setCursor(20, 70);
-        display.print("Coaster");
-        display.setCursor(35, 95);
-        display.print("Clip");
+        display.setFont(&FreeSansBold18pt7b);
+
+        // Center "Think" on first line
+        int16_t x1, y1;
+        uint16_t w, h;
+        display.getTextBounds("Think", 0, 0, &x1, &y1, &w, &h);
+        display.setCursor((176 - w) / 2, 75);
+        display.print("Think");
+
+        // Center "Water" on second line
+        display.getTextBounds("Water", 0, 0, &x1, &y1, &w, &h);
+        display.setCursor((176 - w) / 2, 110);
+        display.print("Water");
+
+        display.setFont(); // Return to default font
         delay(1500);
 
         // Clear screen for later use
@@ -427,19 +469,40 @@ void initSensor() {
 
 void initSD() {
     // SPI bus is already initialized in initSPI()
-    if (SD.begin(PIN_SD_CS)) {
-        sdInitialized = true;
-        Serial.println("SD card initialized");
-        if (!SD.exists("/hydration")) {
-            SD.mkdir("/hydration");
+    // SD cards need significant time to stabilize after power-on
+    // Some cards need up to 1 second for internal voltage regulators
+    Serial.println("Waiting for SD card to stabilize after power-on...");
+    delay(500);  // Initial delay for card stabilization
+
+    // Try multiple times with increasing delays (some cards are slow)
+    const int maxRetries = 3;
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        Serial.printf("SD card init attempt %d/%d...\n", attempt, maxRetries);
+
+        if (SD.begin(PIN_SD_CS)) {
+            sdInitialized = true;
+            Serial.println("SD card initialized successfully");
+
+            // Create required directories
+            if (!SD.exists("/hydration")) {
+                SD.mkdir("/hydration");
+            }
+            if (!SD.exists("/config")) {
+                SD.mkdir("/config");
+            }
+            return;  // Success!
         }
-        if (!SD.exists("/config")) {
-            SD.mkdir("/config");
+
+        // Failed - wait before retry (except on last attempt)
+        if (attempt < maxRetries) {
+            Serial.printf("SD init failed, retrying in %dms...\n", attempt * 200);
+            delay(attempt * 200);  // Exponential backoff: 200ms, 400ms
         }
-    } else {
-        Serial.println("WARNING: SD card initialization failed!");
-        sdInitialized = false;
     }
+
+    // All attempts failed
+    Serial.println("ERROR: SD card initialization failed after all retries!");
+    sdInitialized = false;
 }
 
 void initBLE() {
@@ -1007,143 +1070,251 @@ bool canAlert() {
 void wakeFromScreenSaver() {
     screenSaverActive = false;
     display.displayOn();
+    displayCache.initialized = false; // Force full redraw
+    setupCache.initialized = false;   // Force full redraw of setup screens too
     lastDisplayUpdate = 0; // Force immediate redraw
 }
 
 void drawSetupScreen() {
     if (!displayInitialized) return;
 
-    display.fillScreen(COLOR_BLACK);
+    bool fullRedraw = !setupCache.initialized || (lastScreen != currentScreen);
 
-    // Header
-    display.fillRect(0, 0, 176, 30, RGB565(40, 80, 120));
-    display.setTextSize(2);
-    display.setTextColor(COLOR_WHITE);
-    display.setCursor(25, 8);
-    display.print("SETUP");
+    // Full redraw on screen change
+    if (fullRedraw) {
+        display.fillScreen(COLOR_BLACK);
+        lastScreen = currentScreen;
 
-    display.setTextSize(1);
-    display.setTextColor(RGB565(180, 180, 180));
+        // Header (static)
+        display.fillRect(0, 0, 176, 30, RGB565(40, 80, 120));
+        display.setTextSize(2);
+        display.setTextColor(COLOR_WHITE);
+        display.setCursor(25, 8);
+        display.print("SETUP");
 
-    int16_t valueY = 80;
+        setupCache.initialized = true;
+    }
+
+    int16_t valueY = 82;  // Adjusted to center value between label and unit
     int16_t labelY = 55;
+    char buf[16];
 
     switch (currentScreen) {
         case Screen::SETUP_AGE:
         case Screen::SETTINGS_AGE: {
-            display.setCursor(45, labelY);
-            display.print("Your Age");
+            if (fullRedraw) {
+                // Static elements
+                display.setTextSize(2);
+                display.setTextColor(RGB565(180, 180, 180));
+                display.setCursor(33, labelY);
+                display.print("Your Age");
 
-            display.setTextSize(4);
-            display.setTextColor(RGB565(100, 200, 255));
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%d", userConfig.age);
-            int16_t textWidth = strlen(buf) * 24;
-            display.setCursor((176 - textWidth) / 2, valueY);
-            display.print(buf);
+                display.setTextSize(2);
+                display.setTextColor(COLOR_WHITE);
+                display.setCursor(60, valueY + 35);
+                display.print("years");
 
-            display.setTextSize(2);
-            display.setTextColor(COLOR_WHITE);
-            display.setCursor(60, valueY + 45);
-            display.print("years");
+                display.setTextSize(1);
+                display.setTextColor(RGB565(100, 100, 100));
+                display.setCursor(25, 150);
+                display.print("Rotate to adjust");
+                display.setCursor(30, 162);
+                display.print("Click to save");
+            }
 
-            // Hints
-            display.setTextSize(1);
-            display.setTextColor(RGB565(100, 100, 100));
-            display.setCursor(25, 150);
-            display.print("Rotate to adjust");
-            display.setCursor(30, 162);
-            display.print("Click to save");
+            // Update value if changed
+            if (fullRedraw || userConfig.age != setupCache.lastAge) {
+                // Clear value area
+                display.fillRect(30, valueY - 5, 116, 40, COLOR_BLACK);
+
+                // Draw new value with nice font
+                display.setTextColor(RGB565(100, 200, 255));
+                display.setFont(&FreeSansBold24pt7b);
+                snprintf(buf, sizeof(buf), "%d", userConfig.age);
+
+                // Get text bounds for centering
+                int16_t x1, y1;
+                uint16_t w, h;
+                display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+                display.setCursor((176 - w) / 2, valueY + 28);
+                display.print(buf);
+                display.setFont(); // Return to default font
+
+                setupCache.lastAge = userConfig.age;
+            }
             break;
         }
 
         case Screen::SETUP_SEX:
         case Screen::SETTINGS_SEX: {
-            display.setCursor(50, labelY);
-            display.print("Your Sex");
+            if (fullRedraw) {
+                // Static elements
+                display.setTextSize(2);
+                display.setTextColor(RGB565(180, 180, 180));
+                display.setCursor(38, labelY);
+                display.print("Your Sex");
 
-            display.setTextSize(3);
-            display.setTextColor(userConfig.sex ? RGB565(100, 200, 255) : RGB565(255, 100, 150));
-            const char* sexText = userConfig.sex ? "MALE" : "FEMALE";
-            int16_t textWidth = strlen(sexText) * 18;
-            display.setCursor((176 - textWidth) / 2, valueY);
-            display.print(sexText);
+                display.setTextSize(1);
+                display.setTextColor(RGB565(100, 100, 100));
+                display.setCursor(25, 150);
+                display.print("Rotate to change");
+                display.setCursor(30, 162);
+                display.print("Click to save");
+            }
 
-            display.setTextSize(1);
-            display.setTextColor(RGB565(100, 100, 100));
-            display.setCursor(25, 150);
-            display.print("Rotate to change");
-            display.setCursor(30, 162);
-            display.print("Click to save");
+            // Update value if changed
+            if (fullRedraw || userConfig.sex != setupCache.lastSex) {
+                // Clear value area
+                display.fillRect(10, valueY - 5, 156, 36, COLOR_BLACK);
+
+                // Draw new value with nice font
+                display.setTextColor(userConfig.sex ? RGB565(100, 200, 255) : RGB565(255, 100, 150));
+                display.setFont(&FreeSansBold18pt7b);
+                const char* sexText = userConfig.sex ? "MALE" : "FEMALE";
+
+                // Get text bounds for centering
+                int16_t x1, y1;
+                uint16_t w, h;
+                display.getTextBounds(sexText, 0, 0, &x1, &y1, &w, &h);
+                display.setCursor((176 - w) / 2, valueY + 24);
+                display.print(sexText);
+                display.setFont(); // Return to default font
+
+                setupCache.lastSex = userConfig.sex;
+            }
             break;
         }
 
         case Screen::SETUP_WEIGHT:
         case Screen::SETTINGS_WEIGHT: {
-            display.setCursor(35, labelY);
-            display.print("Your Weight");
+            if (fullRedraw) {
+                // Static elements
+                display.setTextSize(2);
+                display.setTextColor(RGB565(180, 180, 180));
+                display.setCursor(18, labelY);
+                display.print("Your Weight");
 
-            display.setTextSize(4);
-            display.setTextColor(RGB565(100, 200, 255));
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%d", userConfig.weight);
-            int16_t textWidth = strlen(buf) * 24;
-            display.setCursor((176 - textWidth) / 2, valueY);
-            display.print(buf);
+                display.setTextSize(2);
+                display.setTextColor(COLOR_WHITE);
+                display.setCursor(70, valueY + 35);
+                display.print("kg");
 
-            display.setTextSize(2);
-            display.setTextColor(COLOR_WHITE);
-            display.setCursor(70, valueY + 45);
-            display.print("kg");
+                display.setTextSize(1);
+                display.setTextColor(RGB565(100, 100, 100));
+                display.setCursor(25, 150);
+                display.print("Rotate to adjust");
+                display.setCursor(30, 162);
+                display.print("Click to save");
+            }
 
-            display.setTextSize(1);
-            display.setTextColor(RGB565(100, 100, 100));
-            display.setCursor(25, 150);
-            display.print("Rotate to adjust");
-            display.setCursor(30, 162);
-            display.print("Click to save");
+            // Update value if changed
+            if (fullRedraw || userConfig.weight != setupCache.lastWeight) {
+                // Clear value area
+                display.fillRect(30, valueY - 5, 116, 40, COLOR_BLACK);
+
+                // Draw new value with nice font
+                display.setTextColor(RGB565(100, 200, 255));
+                display.setFont(&FreeSansBold24pt7b);
+                snprintf(buf, sizeof(buf), "%d", userConfig.weight);
+
+                // Get text bounds for centering
+                int16_t x1, y1;
+                uint16_t w, h;
+                display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+                display.setCursor((176 - w) / 2, valueY + 28);
+                display.print(buf);
+                display.setFont(); // Return to default font
+
+                setupCache.lastWeight = userConfig.weight;
+            }
             break;
         }
 
         case Screen::SETUP_HOUR:
-        case Screen::SETUP_MINUTE:
-        case Screen::SETTINGS_HOUR:
-        case Screen::SETTINGS_MINUTE: {
-            display.setCursor(30, labelY);
-            display.print("Set Time");
-
-            if (currentScreen == Screen::SETUP_HOUR || currentScreen == Screen::SETTINGS_HOUR) {
-                display.setTextSize(1);
+        case Screen::SETTINGS_HOUR: {
+            if (fullRedraw) {
+                // Static elements
+                display.setTextSize(2);
                 display.setTextColor(RGB565(180, 180, 180));
-                display.setCursor(60, 70);
+                display.setCursor(30, labelY - 2);
+                display.print("Set Time");
+
+                display.setTextSize(2);
+                display.setCursor(65, 68);
                 display.print("Hour");
 
-                display.setTextSize(4);
-                display.setTextColor(RGB565(100, 200, 255));
-                char buf[8];
-                snprintf(buf, sizeof(buf), "%02d", setupHour);
-                display.setCursor(58, 90);
-                display.print(buf);
-            } else {
                 display.setTextSize(1);
-                display.setTextColor(RGB565(180, 180, 180));
-                display.setCursor(55, 70);
-                display.print("Minute");
-
-                display.setTextSize(4);
-                display.setTextColor(RGB565(100, 200, 255));
-                char buf[8];
-                snprintf(buf, sizeof(buf), "%02d", setupMinute);
-                display.setCursor(58, 90);
-                display.print(buf);
+                display.setTextColor(RGB565(100, 100, 100));
+                display.setCursor(25, 150);
+                display.print("Rotate to adjust");
+                display.setCursor(30, 162);
+                display.print("Click to save");
             }
 
-            display.setTextSize(1);
-            display.setTextColor(RGB565(100, 100, 100));
-            display.setCursor(25, 150);
-            display.print("Rotate to adjust");
-            display.setCursor(30, 162);
-            display.print("Click to save");
+            // Update value if changed
+            if (fullRedraw || setupHour != setupCache.lastSetupHour) {
+                // Clear value area
+                display.fillRect(50, 85, 76, 40, COLOR_BLACK);
+
+                // Draw new value with nice font
+                display.setTextColor(RGB565(100, 200, 255));
+                display.setFont(&FreeSansBold24pt7b);
+                snprintf(buf, sizeof(buf), "%02d", setupHour);
+
+                // Get text bounds for centering
+                int16_t x1, y1;
+                uint16_t w, h;
+                display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+                display.setCursor((176 - w) / 2, 118);
+                display.print(buf);
+                display.setFont(); // Return to default font
+
+                setupCache.lastSetupHour = setupHour;
+            }
+            break;
+        }
+
+        case Screen::SETUP_MINUTE:
+        case Screen::SETTINGS_MINUTE: {
+            if (fullRedraw) {
+                // Static elements
+                display.setTextSize(2);
+                display.setTextColor(RGB565(180, 180, 180));
+                display.setCursor(30, labelY - 2);
+                display.print("Set Time");
+
+                display.setTextSize(2);
+                display.setCursor(55, 68);
+                display.print("Minute");
+
+                display.setTextSize(1);
+                display.setTextColor(RGB565(100, 100, 100));
+                display.setCursor(25, 150);
+                display.print("Rotate to adjust");
+                display.setCursor(30, 162);
+                display.print("Click to save");
+            }
+
+            // Update value if changed
+            if (fullRedraw || setupMinute != setupCache.lastSetupMinute) {
+                // Clear value area
+                display.fillRect(50, 85, 76, 40, COLOR_BLACK);
+
+                // Draw new value with nice font
+                display.setTextColor(RGB565(100, 200, 255));
+                display.setFont(&FreeSansBold24pt7b);
+                snprintf(buf, sizeof(buf), "%02d", setupMinute);
+
+                // Get text bounds for centering
+                int16_t x1, y1;
+                uint16_t w, h;
+                display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+                display.setCursor((176 - w) / 2, 118);
+                display.print(buf);
+                display.setFont(); // Return to default font
+
+                setupCache.lastSetupMinute = setupMinute;
+            }
             break;
         }
 
@@ -1158,153 +1329,255 @@ void drawMainScreen() {
         return;
     }
 
-    //Serial.println("drawMainScreen: filling screen...");
-    display.fillScreen(RGB565(15, 20, 30));
-    //Serial.println("drawMainScreen: screen filled");
+    char buf[16];
+    bool fullRedraw = !displayCache.initialized || (lastScreen != currentScreen);
 
-    // Header with gradient effect
-    display.fillRect(0, 0, 176, 35, RGB565(30, 60, 100));
-    display.drawFastHLine(0, 35, 176, RGB565(100, 150, 200));
-
-    display.setTextSize(2);
-    display.setTextColor(COLOR_WHITE);
-    display.setCursor(15, 10);
-    display.print("HYDRATION");
-
-    // Calculate progress percentage
+    // Calculate current values
     float progress = 0.0f;
     if (hydrationState.dailyGoalML > 0) {
         progress = (hydrationState.totalConsumedML / hydrationState.dailyGoalML) * 100.0f;
         if (progress > 100.0f) progress = 100.0f;
     }
 
-    // Progress section
-    display.setTextSize(1);
-    display.setTextColor(RGB565(200, 200, 200));
-    display.setCursor(10, 45);
-    display.print("Daily Goal Progress");
-
-    // Large progress display
-    display.setTextSize(3);
-    uint16_t progressColor;
-    if (progress < 30) {
-        progressColor = RGB565(255, 100, 100);
-    } else if (progress < 70) {
-        progressColor = RGB565(255, 200, 100);
-    } else {
-        progressColor = RGB565(100, 255, 150);
-    }
-    display.setTextColor(progressColor);
-
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.0f%%", progress);
-    int16_t textWidth = strlen(buf) * 18;
-    display.setCursor((176 - textWidth) / 2, 62);
-    display.print(buf);
-
-    // Progress bar
-    int16_t barWidth = 150;
-    int16_t barHeight = 12;
-    int16_t barX = (176 - barWidth) / 2;
-    int16_t barY = 90;
-
-    display.drawRect(barX - 1, barY - 1, barWidth + 2, barHeight + 2, RGB565(100, 150, 200));
-    display.fillRect(barX, barY, barWidth, barHeight, RGB565(30, 40, 50));
-
-    int16_t fillWidth = (int16_t)((progress / 100.0f) * barWidth);
-    if (fillWidth > 0) {
-        display.fillRect(barX, barY, fillWidth, barHeight, progressColor);
-    }
-
-    // Consumption details
-    display.setTextSize(1);
-    display.setTextColor(RGB565(180, 180, 180));
-    display.setCursor(10, 110);
-    snprintf(buf, sizeof(buf), "%.0f / %.0f mL",
-             hydrationState.totalConsumedML,
-             hydrationState.dailyGoalML);
-    display.print(buf);
-
-    // Temperature and Humidity section
-    display.drawFastHLine(5, 128, 166, RGB565(80, 80, 80));
-
-    // Temperature
     SensorReading currentReading;
     readSensor(&currentReading);
 
-    display.setTextSize(1);
-    display.setTextColor(RGB565(200, 200, 200));
-    display.setCursor(10, 135);
-    display.print("Temp:");
-
-    display.setTextSize(2);
-    uint16_t tempColor;
-    if (currentReading.temperature < 18) {
-        tempColor = RGB565(100, 150, 255);
-    } else if (currentReading.temperature > 26) {
-        tempColor = RGB565(255, 150, 100);
-    } else {
-        tempColor = RGB565(150, 255, 150);
-    }
-    display.setTextColor(tempColor);
-    display.setCursor(10, 148);
-    snprintf(buf, sizeof(buf), "%.1f", currentReading.temperature);
-    display.print(buf);
-    display.setTextSize(1);
-    display.setCursor(52, 152);
-    display.print("C");
-
-    // Humidity
-    display.setTextSize(1);
-    display.setTextColor(RGB565(200, 200, 200));
-    display.setCursor(100, 135);
-    display.print("Humid:");
-
-    display.setTextSize(2);
-    uint16_t humidColor;
-    if (currentReading.humidity < 30) {
-        humidColor = RGB565(255, 200, 100);
-    } else if (currentReading.humidity > 70) {
-        humidColor = RGB565(100, 150, 255);
-    } else {
-        humidColor = RGB565(150, 255, 150);
-    }
-    display.setTextColor(humidColor);
-    display.setCursor(100, 148);
-    snprintf(buf, sizeof(buf), "%.0f", currentReading.humidity);
-    display.print(buf);
-    display.setTextSize(1);
-    display.setCursor(134, 152);
-    display.print("%");
-
-    // Time display (if RTC available)
+    uint8_t currentHour = 0;
+    uint8_t currentMinute = 0;
     if (rtcInitialized) {
         DateTime now = rtc.now();
+        currentHour = now.hour();
+        currentMinute = now.minute();
+    }
+
+    // Full redraw on first display or screen change
+    if (fullRedraw) {
+        display.fillScreen(RGB565(15, 20, 30));
+
+        // Header with gradient effect (static elements)
+        display.fillRect(0, 0, 176, 35, RGB565(30, 60, 100));
+        display.drawFastHLine(0, 35, 176, RGB565(100, 150, 200));
+
+        display.setTextSize(2);
+        display.setTextColor(COLOR_WHITE);
+        display.setCursor(15, 10);
+        display.print("HYDRATION");
+
+        // Progress section label (static)
+        display.setTextSize(1);
+        display.setTextColor(RGB565(200, 200, 200));
+        display.setCursor(10, 45);
+        display.print("Daily Goal Progress");
+
+        // Temperature and Humidity section divider (static)
+        display.drawFastHLine(5, 128, 166, RGB565(80, 80, 80));
+
+        // Temperature label (static)
+        display.setTextSize(1);
+        display.setTextColor(RGB565(200, 200, 200));
+        display.setCursor(10, 135);
+        display.print("Temp:");
+
+        // Humidity label (static)
+        display.setCursor(100, 135);
+        display.print("Humid:");
+
+        // Footer hint (static)
+        display.setTextSize(1);
+        display.setTextColor(RGB565(100, 100, 100));
+        display.setCursor(35, 167);
+        display.print("Click for menu");
+
+        displayCache.initialized = true;
+    }
+
+    // Update progress percentage if changed
+    if (fullRedraw || fabsf(progress - displayCache.lastProgress) > 0.5f) {
+        // Clear progress area
+        display.fillRect(20, 55, 136, 32, RGB565(15, 20, 30));
+
+        // Redraw progress percentage with nice font
+        uint16_t progressColor;
+        if (progress < 30) {
+            progressColor = RGB565(255, 100, 100);
+        } else if (progress < 70) {
+            progressColor = RGB565(255, 200, 100);
+        } else {
+            progressColor = RGB565(100, 255, 150);
+        }
+        display.setTextColor(progressColor);
+        display.setFont(&FreeSansBold18pt7b);
+
+        snprintf(buf, sizeof(buf), "%.0f%%", progress);
+
+        // Get text bounds for centering
+        int16_t x1, y1;
+        uint16_t w, h;
+        display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+        display.setCursor((176 - w) / 2, 80);
+        display.print(buf);
+
+        display.setFont(); // Return to default font
+
+        displayCache.lastProgress = progress;
+    }
+
+    // Update progress bar if changed
+    if (fullRedraw || fabsf(progress - displayCache.lastProgress) > 0.5f) {
+        int16_t barWidth = 150;
+        int16_t barHeight = 12;
+        int16_t barX = (176 - barWidth) / 2;
+        int16_t barY = 90;
+
+        uint16_t progressColor;
+        if (progress < 30) {
+            progressColor = RGB565(255, 100, 100);
+        } else if (progress < 70) {
+            progressColor = RGB565(255, 200, 100);
+        } else {
+            progressColor = RGB565(100, 255, 150);
+        }
+
+        display.drawRect(barX - 1, barY - 1, barWidth + 2, barHeight + 2, RGB565(100, 150, 200));
+        display.fillRect(barX, barY, barWidth, barHeight, RGB565(30, 40, 50));
+
+        int16_t fillWidth = (int16_t)((progress / 100.0f) * barWidth);
+        if (fillWidth > 0) {
+            display.fillRect(barX, barY, fillWidth, barHeight, progressColor);
+        }
+    }
+
+    // Update consumption details if changed
+    if (fullRedraw ||
+        fabsf(hydrationState.totalConsumedML - displayCache.lastConsumed) > 0.5f ||
+        fabsf(hydrationState.dailyGoalML - displayCache.lastGoal) > 0.5f) {
+
+        // Clear consumption area
+        display.fillRect(10, 110, 156, 10, RGB565(15, 20, 30));
+
+        display.setTextSize(1);
+        display.setTextColor(RGB565(180, 180, 180));
+        display.setCursor(10, 110);
+        snprintf(buf, sizeof(buf), "%.0f / %.0f mL",
+                 hydrationState.totalConsumedML,
+                 hydrationState.dailyGoalML);
+        display.print(buf);
+
+        displayCache.lastConsumed = hydrationState.totalConsumedML;
+        displayCache.lastGoal = hydrationState.dailyGoalML;
+    }
+
+    // Update temperature if changed
+    if (fullRedraw || fabsf(currentReading.temperature - displayCache.lastTemp) > 0.2f) {
+        // Clear temperature value area
+        display.fillRect(10, 143, 75, 22, RGB565(15, 20, 30));
+
+        uint16_t tempColor;
+        if (currentReading.temperature < 18) {
+            tempColor = RGB565(100, 150, 255);
+        } else if (currentReading.temperature > 26) {
+            tempColor = RGB565(255, 150, 100);
+        } else {
+            tempColor = RGB565(150, 255, 150);
+        }
+        display.setTextColor(tempColor);
+        display.setFont(&FreeSans12pt7b);
+        display.setCursor(10, 162);
+        snprintf(buf, sizeof(buf), "%.1f", currentReading.temperature);
+        display.print(buf);
+        display.setFont(); // Return to default font
+
+        // Draw degree symbol as a small circle
+        display.drawCircle(60, 150, 2, tempColor);
+        display.drawCircle(60, 150, 1, tempColor);  // Fill the circle
+
+        // Add C unit with same font family
+        display.setTextColor(tempColor);
+        display.setFont(&FreeSans9pt7b);
+        display.setCursor(65, 162);
+        display.print("C");
+        display.setFont(); // Return to default font
+
+        displayCache.lastTemp = currentReading.temperature;
+    }
+
+    // Update humidity if changed
+    if (fullRedraw || fabsf(currentReading.humidity - displayCache.lastHumidity) > 1.0f) {
+        // Clear humidity value area
+        display.fillRect(100, 143, 70, 22, RGB565(15, 20, 30));
+
+        uint16_t humidColor;
+        if (currentReading.humidity < 30) {
+            humidColor = RGB565(255, 200, 100);
+        } else if (currentReading.humidity > 70) {
+            humidColor = RGB565(100, 150, 255);
+        } else {
+            humidColor = RGB565(150, 255, 150);
+        }
+        display.setTextColor(humidColor);
+        display.setFont(&FreeSans12pt7b);
+        display.setCursor(100, 162);
+        snprintf(buf, sizeof(buf), "%.0f", currentReading.humidity);
+        display.print(buf);
+
+        // Calculate position for % symbol right after the value
+        int16_t x1, y1;
+        uint16_t w, h;
+        display.getTextBounds(buf, 100, 162, &x1, &y1, &w, &h);
+
+        // Add % symbol with same font family, positioned right after value
+        display.setFont(&FreeSans9pt7b);
+        display.setCursor(100 + w + 2, 162);  // 2 pixel gap
+        display.print("%");
+        display.setFont(); // Return to default font
+
+        displayCache.lastHumidity = currentReading.humidity;
+    }
+
+    // Update time if changed (every minute)
+    if (rtcInitialized &&
+        (fullRedraw || currentHour != displayCache.lastHour || currentMinute != displayCache.lastMinute)) {
+
+        // Clear time area
+        display.fillRect(130, 10, 40, 10, RGB565(30, 60, 100));
+
         display.setTextSize(1);
         display.setTextColor(RGB565(150, 150, 150));
         display.setCursor(130, 10);
-        snprintf(buf, sizeof(buf), "%02d:%02d", now.hour(), now.minute());
+        snprintf(buf, sizeof(buf), "%02d:%02d", currentHour, currentMinute);
         display.print(buf);
+
+        displayCache.lastHour = currentHour;
+        displayCache.lastMinute = currentMinute;
     }
 
-    // Footer hint
-    display.setTextSize(1);
-    display.setTextColor(RGB565(100, 100, 100));
-    display.setCursor(35, 167);
-    display.print("Click for menu");
+    lastScreen = currentScreen;
 }
 
 void drawMenuScreen() {
     if (!displayInitialized) return;
 
-    display.fillScreen(RGB565(15, 20, 30));
+    // Only clear screen on first draw or screen change
+    static MenuOption lastSelectedOption = MenuOption::BACK_TO_MAIN;
+    bool fullRedraw = (lastScreen != currentScreen);
 
-    // Header
-    display.fillRect(0, 0, 176, 30, RGB565(40, 80, 120));
-    display.setTextSize(2);
-    display.setTextColor(COLOR_WHITE);
-    display.setCursor(45, 8);
-    display.print("MENU");
+    if (fullRedraw) {
+        display.fillScreen(RGB565(15, 20, 30));
+        lastScreen = currentScreen;
+
+        // Header (static)
+        display.fillRect(0, 0, 176, 30, RGB565(40, 80, 120));
+        display.setTextSize(2);
+        display.setTextColor(COLOR_WHITE);
+        display.setCursor(45, 8);
+        display.print("MENU");
+
+        // Footer hint (static)
+        display.setTextSize(1);
+        display.setTextColor(RGB565(100, 100, 100));
+        display.setCursor(20, 167);
+        display.print("Rotate & Click to select");
+    }
 
     // Menu options
     const char* options[] = {
@@ -1317,38 +1590,58 @@ void drawMenuScreen() {
     int16_t optionY = 40;
     int16_t optionHeight = 28;
 
-    for (int i = 0; i < 4; i++) {
-        bool isSelected = (i == (int)selectedMenuOption);
+    // Only redraw if selection changed or full redraw needed
+    if (fullRedraw || selectedMenuOption != lastSelectedOption) {
+        for (int i = 0; i < 4; i++) {
+            bool isSelected = (i == (int)selectedMenuOption);
+            bool wasSelected = (i == (int)lastSelectedOption);
 
-        if (isSelected) {
-            display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(50, 100, 150));
-            display.drawRect(5, optionY + i * optionHeight, 166, 25, RGB565(100, 200, 255));
+            // Only redraw this option if its state changed or full redraw
+            if (fullRedraw || isSelected != wasSelected) {
+                // Clear the option area first
+                display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(15, 20, 30));
+
+                // Draw selection background if selected
+                if (isSelected) {
+                    display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(50, 100, 150));
+                    display.drawRect(5, optionY + i * optionHeight, 166, 25, RGB565(100, 200, 255));
+                }
+
+                // Draw text
+                display.setTextSize(2);
+                display.setTextColor(isSelected ? COLOR_WHITE : RGB565(180, 180, 180));
+                display.setCursor(15, optionY + i * optionHeight + 5);
+                display.print(options[i]);
+            }
         }
-
-        display.setTextSize(1);
-        display.setTextColor(isSelected ? COLOR_WHITE : RGB565(180, 180, 180));
-        display.setCursor(15, optionY + i * optionHeight + 8);
-        display.print(options[i]);
+        lastSelectedOption = selectedMenuOption;
     }
-
-    // Footer hint
-    display.setTextSize(1);
-    display.setTextColor(RGB565(100, 100, 100));
-    display.setCursor(20, 167);
-    display.print("Rotate & Click to select");
 }
 
 void drawDebugMenu() {
     if (!displayInitialized) return;
 
-    display.fillScreen(RGB565(15, 20, 30));
+    // Only clear screen on first draw or screen change
+    static DebugOption lastSelectedDebugOpt = DebugOption::BACK_TO_MENU;
+    bool fullRedraw = (lastScreen != currentScreen);
 
-    // Header
-    display.fillRect(0, 0, 176, 30, RGB565(120, 40, 40));
-    display.setTextSize(2);
-    display.setTextColor(COLOR_WHITE);
-    display.setCursor(35, 8);
-    display.print("DEBUG");
+    if (fullRedraw) {
+        display.fillScreen(RGB565(15, 20, 30));
+        lastScreen = currentScreen;
+
+        // Header (static)
+        display.fillRect(0, 0, 176, 30, RGB565(120, 40, 40));
+        display.setTextSize(2);
+        display.setTextColor(COLOR_WHITE);
+        display.setCursor(35, 8);
+        display.print("DEBUG");
+
+        // Footer hint (static)
+        display.setTextSize(1);
+        display.setTextColor(RGB565(100, 100, 100));
+        display.setCursor(20, 167);
+        display.print("Rotate & Click to select");
+    }
 
     // Debug options
     const char* options[] = {
@@ -1361,25 +1654,32 @@ void drawDebugMenu() {
     int16_t optionY = 40;
     int16_t optionHeight = 28;
 
-    for (int i = 0; i < 4; i++) {
-        bool isSelected = (i == (int)selectedDebugOption);
+    // Only redraw if selection changed or full redraw needed
+    if (fullRedraw || selectedDebugOption != lastSelectedDebugOpt) {
+        for (int i = 0; i < 4; i++) {
+            bool isSelected = (i == (int)selectedDebugOption);
+            bool wasSelected = (i == (int)lastSelectedDebugOpt);
 
-        if (isSelected) {
-            display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(150, 50, 50));
-            display.drawRect(5, optionY + i * optionHeight, 166, 25, RGB565(255, 100, 100));
+            // Only redraw this option if its state changed or full redraw
+            if (fullRedraw || isSelected != wasSelected) {
+                // Clear the option area first
+                display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(15, 20, 30));
+
+                // Draw selection background if selected
+                if (isSelected) {
+                    display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(150, 50, 50));
+                    display.drawRect(5, optionY + i * optionHeight, 166, 25, RGB565(255, 100, 100));
+                }
+
+                // Draw text
+                display.setTextSize(2);
+                display.setTextColor(isSelected ? COLOR_WHITE : RGB565(180, 180, 180));
+                display.setCursor(15, optionY + i * optionHeight + 5);
+                display.print(options[i]);
+            }
         }
-
-        display.setTextSize(1);
-        display.setTextColor(isSelected ? COLOR_WHITE : RGB565(180, 180, 180));
-        display.setCursor(15, optionY + i * optionHeight + 8);
-        display.print(options[i]);
+        lastSelectedDebugOpt = selectedDebugOption;
     }
-
-    // Footer hint
-    display.setTextSize(1);
-    display.setTextColor(RGB565(100, 100, 100));
-    display.setCursor(20, 167);
-    display.print("Rotate & Click to select");
 }
 
 void updateDisplay() {
@@ -1448,7 +1748,8 @@ void handleEncoderInput() {
 
             case Screen::SETUP_SEX:
             case Screen::SETTINGS_SEX:
-                userConfig.sex = (delta > 0) ? 1 : 0;
+                // Toggle sex selection (wraps around)
+                userConfig.sex = 1 - userConfig.sex;
                 lastDisplayUpdate = 0;
                 break;
 
