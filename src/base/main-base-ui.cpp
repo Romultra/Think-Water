@@ -60,6 +60,8 @@ extern float predictWaterTurnoverCH(
 #define POST_CONNECT_DELAY_MS       2000                      // Wait for data after connect
 #define DISPLAY_UPDATE_INTERVAL_MS  1000                      // Update display every second
 #define SCREENSAVER_TIMEOUT_MS      (5UL * 60UL * 1000UL)    // 5 minutes of inactivity
+#define BUZZER_HIGH_DURATION_MS      800                       // 200ms buzzer on for alerts
+#define BUZZER_LOW_DURATION_MS       400                       // 100ms buzzer off between beeps
 
 // ============================================================================
 // Hydration Constants
@@ -212,14 +214,13 @@ BLERemoteCharacteristic* pCommandChar = nullptr;
 BLERemoteCharacteristic* pGoalChar = nullptr;
 BLEScan* pBLEScan = nullptr;
 BLEAdvertisedDevice* coasterDevice = nullptr;
-bool coasterFound = false;
-bool coasterHasData = false;
+volatile bool scanInProgress = false;
+volatile bool coasterFound = false;
+volatile bool coasterHasData = false;
 bool alertPending = false;
 bool goalPending = false;
 float pendingGoal = 0.0f;
-uint32_t lastScanTime = 0;
 uint32_t connectStartTime = 0;
-bool scanInProgress = false;
 
 // Hydration tracking
 HydrationState hydrationState = {0, 0.0f, 0.0f, 0, false};
@@ -251,7 +252,6 @@ void saveUserConfig();
 void loadUserConfig();
 void processBLEState();
 void startScan();
-void stopScan();
 bool connectToCoaster();
 void disconnectFromCoaster();
 bool sendCommand(uint8_t cmd);
@@ -305,34 +305,58 @@ class MyClientCallback : public BLEClientCallbacks {
 
     void onDisconnect(BLEClient* pclient) override {
         Serial.println("BLE: Disconnected from coaster");
-        bleState = BLEState::IDLE;
+        // Clear characteristic pointers - they're invalid after disconnect
+        pConsumptionChar = nullptr;
+        pCommandChar = nullptr;
+        pGoalChar = nullptr;
     }
 };
 
+// Static callback instance to avoid memory leak
+static MyClientCallback clientCallback;
+
 class MyScanCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
+        // Check if this is our coaster by service UUID
         if (advertisedDevice.haveServiceUUID() &&
             advertisedDevice.isAdvertisingService(BLEUUID(COASTER_SERVICE_UUID))) {
 
-            coasterHasData = false;
+            // Parse manufacturer data to check data pending flag
+            bool hasData = false;
             if (advertisedDevice.haveManufacturerData()) {
                 std::string mfgData = advertisedDevice.getManufacturerData();
                 if (mfgData.length() >= 3) {
                     uint16_t companyId = (uint8_t)mfgData[0] | ((uint8_t)mfgData[1] << 8);
                     if (companyId == COASTER_MFG_COMPANY_ID) {
                         uint8_t flag = (uint8_t)mfgData[2];
-                        coasterHasData = (flag == 0x01);
+                        hasData = (flag == 0x01);
                     }
                 }
             }
 
+            // Update global state
+            coasterHasData = hasData;
+
+            // Store device for later connection
             if (coasterDevice != nullptr) {
                 delete coasterDevice;
             }
             coasterDevice = new BLEAdvertisedDevice(advertisedDevice);
             coasterFound = true;
-            scanInProgress = false;
-            pBLEScan->stop();
+
+            // Only stop scan if we need to connect
+            bool shouldConnect = hasData || alertPending || goalPending;
+            if (shouldConnect && scanInProgress) {
+                Serial.print("BLE: Coaster found, need to connect (data=");
+                Serial.print(hasData ? "Y" : "N");
+                Serial.print(" alert=");
+                Serial.print(alertPending ? "Y" : "N");
+                Serial.print(" goal=");
+                Serial.print(goalPending ? "Y" : "N");
+                Serial.println(")");
+                scanInProgress = false;
+                pBLEScan->stop();
+            }
         }
     }
 };
@@ -421,9 +445,9 @@ void initSD() {
 void initBLE() {
     BLEDevice::init("CoasterClip-Base");
     pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyScanCallbacks());
-    pBLEScan->setInterval(1349);
-    pBLEScan->setWindow(449);
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyScanCallbacks(), true);  // true = allow duplicates
+    pBLEScan->setInterval(100);   // 100 * 0.625ms = 62.5ms - fast scanning
+    pBLEScan->setWindow(99);      // 99 * 0.625ms = 61.9ms - nearly continuous
     pBLEScan->setActiveScan(true);
     Serial.println("BLE initialized");
 }
@@ -764,39 +788,28 @@ bool isNewDay() {
 // BLE Functions
 // ============================================================================
 
-static void scanCompleteCB(BLEScanResults results) {
-    scanInProgress = false;
-}
-
 void startScan() {
     coasterFound = false;
-    coasterHasData = false;
     scanInProgress = true;
     bleState = BLEState::SCANNING;
-    // Start continuous scan (0 = infinite duration)
-    pBLEScan->start(0, scanCompleteCB, false);
-    Serial.println("BLE: Started continuous background scan");
-}
-
-void stopScan() {
-    if (scanInProgress) {
-        pBLEScan->stop();
-        scanInProgress = false;
-        Serial.println("BLE: Stopped scan");
-    }
+    // Start continuous scan - runs until we stop it
+    pBLEScan->start(0, nullptr, false);
 }
 
 bool connectToCoaster() {
     if (coasterDevice == nullptr) return false;
 
-    if (pClient != nullptr) {
-        delete pClient;
+    // Reuse existing client or create new one
+    if (pClient == nullptr) {
+        pClient = BLEDevice::createClient();
+        pClient->setClientCallbacks(&clientCallback);
     }
 
-    pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new MyClientCallback());
+    Serial.print("BLE: Connecting to ");
+    Serial.println(coasterDevice->getAddress().toString().c_str());
 
     if (!pClient->connect(coasterDevice)) {
+        Serial.println("BLE: Connection failed");
         return false;
     }
 
@@ -804,6 +817,7 @@ bool connectToCoaster() {
 
     BLERemoteService* pRemoteService = pClient->getService(COASTER_SERVICE_UUID);
     if (pRemoteService == nullptr) {
+        Serial.println("BLE: Service not found");
         pClient->disconnect();
         return false;
     }
@@ -813,6 +827,7 @@ bool connectToCoaster() {
     pGoalChar = pRemoteService->getCharacteristic(GOAL_CHAR_UUID);
 
     if (pConsumptionChar == nullptr || pCommandChar == nullptr || pGoalChar == nullptr) {
+        Serial.println("BLE: Characteristics not found");
         pClient->disconnect();
         return false;
     }
@@ -855,75 +870,70 @@ bool sendGoal(float goalML) {
 void processBLEState() {
     switch (bleState) {
         case BLEState::IDLE:
-            // Continuous scan is always running, no need to start periodically
-            // Just check if we need to connect
-            if (coasterFound) {
-                bool shouldConnect = coasterHasData || alertPending || goalPending;
-                if (shouldConnect) {
-                    Serial.println("BLE: Coaster found, initiating connection");
-                    stopScan();  // Stop scan before connecting
-                    bleState = BLEState::CONNECTING;
-                    if (connectToCoaster()) {
-                        // Connection successful, will be handled in CONNECTED state
-                    } else {
-                        // Connection failed, restart scan
-                        bleState = BLEState::IDLE;
-                        startScan();
-                    }
-                }
-            }
+            // Start scanning immediately
+            startScan();
             break;
 
         case BLEState::SCANNING:
-            // In continuous mode, we stay in SCANNING until we find and connect
-            // The IDLE case handles connection logic
-            if (coasterFound) {
-                bool shouldConnect = coasterHasData || alertPending || goalPending;
-                if (shouldConnect) {
-                    Serial.println("BLE: Coaster found during scan, connecting");
-                    stopScan();
-                    bleState = BLEState::CONNECTING;
-                    if (!connectToCoaster()) {
-                        bleState = BLEState::SCANNING;
-                        startScan();
-                    }
+            // Scan runs continuously. Callback stops it when we need to connect.
+            if (!scanInProgress && coasterFound) {
+                // Callback stopped the scan because we need to connect
+                if (connectToCoaster()) {
+                    // Success - state is now CONNECTED
+                } else {
+                    // Failed - resume scanning
+                    startScan();
                 }
             }
             break;
 
         case BLEState::CONNECTING:
-            // Connection attempt is synchronous in connectToCoaster()
-            // State is set by that function
+            // Not used - connectToCoaster() is synchronous
+            // If we somehow end up here, go back to IDLE
+            bleState = BLEState::IDLE;
             break;
 
         case BLEState::CONNECTED:
+            // Check for unexpected disconnect
+            if (pClient == nullptr || !pClient->isConnected()) {
+                Serial.println("BLE: Unexpected disconnect, resuming scan");
+                startScan();
+                break;
+            }
+
+            // Send pending goal first
             if (goalPending) {
                 if (sendGoal(pendingGoal)) {
+                    Serial.print("BLE: Sent goal ");
+                    Serial.println(pendingGoal);
                     goalPending = false;
                     hydrationState.goalSentToCoaster = true;
                 }
             }
 
+            // Send pending alert
             if (alertPending) {
                 if (sendCommand(0x01)) {
+                    Serial.println("BLE: Alert sent to coaster");
                     alertPending = false;
                     lastAlertTime = millis();
                     hydrationState.remindersSent++;
+                    soundBuzzer();  // Beep after coaster received the alert
                 }
             }
 
+            // Wait for potential incoming data, then disconnect
             if (millis() - connectStartTime > POST_CONNECT_DELAY_MS) {
                 if (!goalPending && !alertPending) {
-                    Serial.println("BLE: Operations complete, disconnecting and resuming scan");
+                    Serial.println("BLE: Operations complete, disconnecting");
                     disconnectFromCoaster();
                 }
             }
             break;
 
         case BLEState::DISCONNECTING:
+            // Wait for disconnect to complete, then resume scanning
             if (pClient == nullptr || !pClient->isConnected()) {
-                bleState = BLEState::SCANNING;
-                // Restart continuous scan after disconnect
                 startScan();
             }
             break;
@@ -973,15 +983,14 @@ void onNewDay() {
 void soundBuzzer() {
     for (int i = 0; i < 3; i++) {
         digitalWrite(PIN_BUZZER, HIGH);
-        delay(100);
+        delay(BUZZER_HIGH_DURATION_MS);
         digitalWrite(PIN_BUZZER, LOW);
-        delay(100);
+        delay(BUZZER_LOW_DURATION_MS);
     }
 }
 
 void triggerAlert() {
-    Serial.println("HYDRATION ALERT!");
-    soundBuzzer();
+    Serial.println("HYDRATION ALERT: Queuing alert for coaster");
     alertPending = true;
 }
 
@@ -1689,21 +1698,10 @@ void setup() {
 
     lastActivity = millis();
 
-    // Start continuous BLE scan for instant connections
-    startScan();
+    // BLE starts in IDLE, state machine will start scanning immediately
 
-    // Test display after all initialization
+    // Force initial display update
     if (displayInitialized) {
-        Serial.println("Testing display after full initialization...");
-        display.fillScreen(COLOR_BLACK);
-        display.setTextSize(2);
-        display.setTextColor(COLOR_GREEN);
-        display.setCursor(10, 80);
-        display.print("READY!");
-        delay(1000);
-        Serial.println("Display test complete");
-
-        // Force initial display update
         lastDisplayUpdate = 0;
         updateDisplay();
     }
