@@ -64,7 +64,7 @@ void updateAdvertisingData(bool hasPendingData);
 
 bool glassChanged = false;
 float hydrationGoal = 2000.0; // Default 2000ml
-float totalConsumed = 0.0;
+float totalConsumed = 1800.0; // Total consumed in grams (ml) TODO: Remove dummy value
 
 // Hysteresis prevents "flickering" events
 // TODO: Calibrate these thresholds experimentally
@@ -151,8 +151,6 @@ static bool performLoadcellStabilityCheck(float &outWeight) {
   }
 
   float x0 = getWeight();
-  Serial.print("x0: ");
-  Serial.println(x0);
   if (isnan(x0)) { outWeight = NAN; return false; }
   float last = x0;
   float sumDelta = 0.0f;
@@ -160,10 +158,6 @@ static bool performLoadcellStabilityCheck(float &outWeight) {
   for (int i = 1; i < STABILITY_SAMPLES; i++) {
     vTaskDelay(pdMS_TO_TICKS(50));
     float w = getWeight();
-    Serial.print("x");
-    Serial.print(i);
-    Serial.print(": ");
-    Serial.println(w);
     if (isnan(w)) { outWeight = NAN; return false; }
     float d = fabsf(w - last);
     sumDelta += d;
@@ -490,6 +484,10 @@ void ledFeedbackTask(void *pvParameters) {
       int currentMs = s * stepMs;
 
       for (int i = 0; i < NUM_NEOPIXELS; i++) {
+        // Map logical LED position to physical position
+        // Position 0 starts at 7th LED (index 6) and rotates in reverse
+        int physicalLed = (6 - i + NUM_NEOPIXELS) % NUM_NEOPIXELS;
+
         // desired final brightness for this LED (0..1)
         float tgtBr = 0.0f;
         if (i < full) tgtBr = 1.0f;
@@ -497,7 +495,7 @@ void ledFeedbackTask(void *pvParameters) {
         else tgtBr = 0.0f;
 
         if (tgtBr <= 0.0f) {
-          strip.setPixelColor(i, 0);
+          strip.setPixelColor(physicalLed, 0);
           continue;
         }
 
@@ -516,7 +514,7 @@ void ledFeedbackTask(void *pvParameters) {
         uint8_t g = (uint8_t)((float)baseG * bri + 0.5f);
         uint8_t b = (uint8_t)((float)baseB * bri + 0.5f);
 
-        strip.setPixelColor(i, strip.Color(r, g, b));
+        strip.setPixelColor(physicalLed, strip.Color(r, g, b));
       }
 
       strip.show();
@@ -525,17 +523,55 @@ void ledFeedbackTask(void *pvParameters) {
 
     // Ensure final exact state matches progress
     for (int i = 0; i < NUM_NEOPIXELS; i++) {
+      // Map logical LED position to physical position
+      int physicalLed = (6 - i + NUM_NEOPIXELS) % NUM_NEOPIXELS;
+
       if (i < full) {
-        strip.setPixelColor(i, strip.Color(baseR, baseG, baseB));
+        strip.setPixelColor(physicalLed, strip.Color(baseR, baseG, baseB));
       } else if (i == full && frac > 0.0f) {
         uint8_t r = (uint8_t)((float)baseR * frac + 0.5f);
         uint8_t g = (uint8_t)((float)baseG * frac + 0.5f);
         uint8_t b = (uint8_t)((float)baseB * frac + 0.5f);
-        strip.setPixelColor(i, strip.Color(r, g, b));
+        strip.setPixelColor(physicalLed, strip.Color(r, g, b));
       } else {
-        strip.setPixelColor(i, 0);
+        strip.setPixelColor(physicalLed, 0);
       }
     }
+    strip.show();
+
+    // Hold the display for 2 seconds
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Smooth fade out over 600ms
+    const int fadeOutMs = 600;
+    const int fadeSteps = fadeOutMs / stepMs;
+    for (int s = 0; s <= fadeSteps; s++) {
+      float fadeProgress = (float)s / (float)fadeSteps; // 0..1
+      float brightness = 1.0f - fadeProgress; // 1..0
+
+      for (int i = 0; i < NUM_NEOPIXELS; i++) {
+        int physicalLed = (6 - i + NUM_NEOPIXELS) % NUM_NEOPIXELS;
+
+        if (i < full) {
+          uint8_t r = (uint8_t)((float)baseR * brightness + 0.5f);
+          uint8_t g = (uint8_t)((float)baseG * brightness + 0.5f);
+          uint8_t b = (uint8_t)((float)baseB * brightness + 0.5f);
+          strip.setPixelColor(physicalLed, strip.Color(r, g, b));
+        } else if (i == full && frac > 0.0f) {
+          uint8_t r = (uint8_t)((float)baseR * frac * brightness + 0.5f);
+          uint8_t g = (uint8_t)((float)baseG * frac * brightness + 0.5f);
+          uint8_t b = (uint8_t)((float)baseB * frac * brightness + 0.5f);
+          strip.setPixelColor(physicalLed, strip.Color(r, g, b));
+        } else {
+          strip.setPixelColor(physicalLed, 0);
+        }
+      }
+      strip.show();
+      vTaskDelay(pdMS_TO_TICKS(stepMs));
+    }
+
+    // Ensure fully off
+    strip.clear();
     strip.show();
 
     xSemaphoreGive(ledMutex);
@@ -895,6 +931,9 @@ void loop() {
           } else if (cmd == 's' || cmd == 'S') {
             Serial.println("\n*** BLE TEST: Stopping advertising ***");
             stopBLEAdvertising();
+          } else if (cmd == 'f' || cmd == 'F') {
+            Serial.println("\n*** LED TEST: Triggering feedback animation ***");
+            xTaskNotifyGive(ledFeedbackTaskHandle);
           }
         }
         break;
