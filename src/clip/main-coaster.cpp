@@ -5,6 +5,7 @@
 #include <task.h>
 #include <Wire.h>
 #include <math.h>
+#include <climits>
 #include <HX711.h>
 #include <Adafruit_FlashTransport.h>
 #include <Adafruit_NeoPixel.h>
@@ -28,7 +29,8 @@ Adafruit_NeoPixel strip(NUM_NEOPIXELS, NEO_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // Load Cell Configuration
 HX711 loadcell;
-const float LOADCELL_CALIBRATION_FACTOR = 1.0; // Placeholder - needs calibration TODO
+const float LOADCELL_SCALE = -373.3692f;  // Calibrated: raw units per gram
+const long LOADCELL_OFFSET = -57432;       // Calibrated: raw value at 0g
 const float THRESHOLD_DRINK_AMOUNT = 5.0; // Minimum weight change (grams) to register a drink event
 float prevWeight = NAN; // NAN until first valid measurement
 
@@ -43,8 +45,8 @@ volatile float loadcellLastWeight = 0.0f;
 
 // Thresholds for loadcell-based stability
 const int STABILITY_SAMPLES = 6;
-const float LOADCELL_BOTTOM_PLATE_THRESHOLD = 30.0f; // grams: weight of bottom plate/contact to consider "on table"
-const float LOADCELL_DEVIATION_THRESHOLD = 0.5f; // grams: max avg deviation to consider stable
+const float LOADCELL_BOTTOM_PLATE_THRESHOLD = -54.0f; // grams: weight of bottom plate/contact to consider "on table"
+const long LOADCELL_RAW_DEVIATION_THRESHOLD = 100; // raw units: max avg deviation to consider stable (~0.5g)
 
 // BLE Objects
 BLEService coasterService(COASTER_SERVICE_UUID);
@@ -64,12 +66,12 @@ void updateAdvertisingData(bool hasPendingData);
 
 bool glassChanged = false;
 float hydrationGoal = 2000.0; // Default 2000ml
-float totalConsumed = 1800.0; // Total consumed in grams (ml) TODO: Remove dummy value
+float totalConsumed = 2000.0; // Total consumed in grams (ml) TODO: Remove dummy value
 
 // Hysteresis prevents "flickering" events
 // TODO: Calibrate these thresholds experimentally
-const int THRESHOLD_HIGH = 470; 
-const int THRESHOLD_LOW = 466;
+const int THRESHOLD_HIGH = 464;  // Above this = no glass (calibrated)
+const int THRESHOLD_LOW = 460;   // Below this = glass present (calibrated)
 
 // Duty Cycle Intervals
 const int FAST_POLL_MS = 200;   // Check fast when interacting
@@ -95,8 +97,8 @@ enum class DeviceState {
   TEST
 };
 
-DeviceState currentState = DeviceState::TEST;
-//DeviceState currentState;
+//DeviceState currentState = DeviceState::TEST;
+DeviceState currentState;
 
 QueueHandle_t eventQueue;
 TimerHandle_t heartbeatTimer;
@@ -122,57 +124,74 @@ void heartbeatCallback(TimerHandle_t xTimer) {
   }
 }
 
-float getWeight() {
-  // Wait for load cell to be ready (with timeout)
-  // HX711 needs time between conversions (10Hz = 100ms, 80Hz = 12.5ms)
-  int timeoutMs = 200;
+// Wait for load cell to be ready with timeout, returns true if ready
+bool waitForLoadcell(int timeoutMs = 200) {
   int waited = 0;
   while (!loadcell.is_ready() && waited < timeoutMs) {
     vTaskDelay(pdMS_TO_TICKS(10));
     waited += 10;
   }
+  return loadcell.is_ready();
+}
 
-  if (loadcell.is_ready()) {
-    // Get average of 3 readings (already calibrated by set_scale)
-    float weight = loadcell.get_units(2);
-    return weight;
-  } else {
+// Get raw ADC reading from load cell (for precision stability checks)
+long getRawReading() {
+  if (!waitForLoadcell()) {
+    return LONG_MIN; // Error value
+  }
+  return loadcell.read();
+}
+
+float getWeight() {
+  // Wait for load cell to be ready (with timeout)
+  // HX711 needs time between conversions (10Hz = 100ms, 80Hz = 12.5ms)
+  if (!waitForLoadcell()) {
     Serial.println("Load cell not ready");
     return NAN; // Return NaN to indicate error/unavailable
   }
+
+  // Get average of 2 readings (already calibrated by set_scale)
+  float weight = loadcell.get_units(2);
+  return weight;
 }
 
 // Perform a stability check using the load cell. This does blocking sampling
 // and should be executed from the dedicated FreeRTOS task (not from ISRs).
+// Uses raw readings for deviation check (more precision) and grams for magnitude check.
 static bool performLoadcellStabilityCheck(float &outWeight) {
   if (!loadcell.is_ready()) {
     outWeight = NAN;
     return false;
   }
 
-  float x0 = getWeight();
-  if (isnan(x0)) { outWeight = NAN; return false; }
-  float last = x0;
-  float sumDelta = 0.0f;
+  // Get first raw reading
+  long rawLast = getRawReading();
+  if (rawLast == LONG_MIN) { outWeight = NAN; return false; }
+  long rawSumDelta = 0;
 
+  // Sample raw readings for deviation check
   for (int i = 1; i < STABILITY_SAMPLES; i++) {
     vTaskDelay(pdMS_TO_TICKS(50));
-    float w = getWeight();
-    if (isnan(w)) { outWeight = NAN; return false; }
-    float d = fabsf(w - last);
-    sumDelta += d;
-    last = w;
+    long rawNow = getRawReading();
+    if (rawNow == LONG_MIN) { outWeight = NAN; return false; }
+    rawSumDelta += labs(rawNow - rawLast);
+    rawLast = rawNow;
   }
 
-  float avgDelta = sumDelta / (STABILITY_SAMPLES - 1);
-  Serial.print("Avg Delta: ");
-  Serial.println(avgDelta);
-  outWeight = last;
+  long avgRawDelta = rawSumDelta / (STABILITY_SAMPLES - 1);
+  Serial.print("Avg Raw Delta: ");
+  Serial.println(avgRawDelta);
 
-  // Consider stable only when weight is positive and above the bottom-plate threshold (on-table)
-  // Negative readings (picked-up pull) are NOT considered stable.
-  bool magOk = (last >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
-  bool stable = magOk && (avgDelta <= LOADCELL_DEVIATION_THRESHOLD);
+  // Get calibrated weight for magnitude check and output
+  float weight = getWeight();
+  if (isnan(weight)) { outWeight = NAN; return false; }
+  outWeight = weight;
+
+  // Magnitude check in grams: must be above threshold (on-table)
+  bool magOk = (weight >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
+  // Deviation check in raw units: more precision for stability detection
+  bool deviationOk = (avgRawDelta <= LOADCELL_RAW_DEVIATION_THRESHOLD);
+  bool stable = magOk && deviationOk;
 
   return stable;
 }
@@ -642,8 +661,8 @@ void setup() {
   while (!loadcell.is_ready()) {
     delay(10);
   }
-  loadcell.set_scale(LOADCELL_CALIBRATION_FACTOR); // Apply calibration factor
-  loadcell.set_offset(0); // Reset offset
+  loadcell.set_scale(LOADCELL_SCALE);   // Apply calibration scale factor
+  loadcell.set_offset(LOADCELL_OFFSET); // Apply calibration zero offset
   Serial.println("Load cell initialized");
   // Initialize NeoPixel strip
   strip.begin();
@@ -667,7 +686,7 @@ void setup() {
   xTimerStart(heartbeatTimer, 0);
 
   // Disable when testing, TODO: Enable when ready
-  // determineInitialState(); 
+  determineInitialState(); 
 
   Serial.println("Coaster Clip Main Setup");
   delay(500);
@@ -679,7 +698,21 @@ void loop() {
   if (xQueueReceive(eventQueue, &evt, portMAX_DELAY) == pdTRUE) {
     bool eventConsumed = false;
     bool glassPresent = false;
-
+    Serial.print("Event received: ");
+    switch (evt.type) {
+      case EventType::BLE_COMMAND_RECEIVED:
+        Serial.println("BLE_COMMAND_RECEIVED");
+        break;
+      case EventType::HEARTBEAT_TICK:
+        Serial.println("HEARTBEAT_TICK");
+        break;
+      case EventType::CHECK_FOR_DRINK:
+        Serial.println("CHECK_FOR_DRINK");
+        break;
+      default:
+        Serial.println("UNKNOWN");
+        break;
+    }
     if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
       uint8_t command = (uint8_t)evt.value;
       if (command == 0x01) { // LED Alert Request
@@ -848,10 +881,10 @@ void loop() {
           // Loadcell cached stability
           bool isAnyStable = loadcellStable;
           float weight = loadcellLastWeight;
-          /*
+          
           // Test hall sensor
           int hallValue = analogRead(HALL_SENSOR_PIN);
-          bool glassPresent = isGlassPresent();*/
+          bool glassPresent = isGlassPresent();
           
           // Print all values to serial monitor
           Serial.print(" | Loadcell Stable: ");
@@ -859,12 +892,12 @@ void loop() {
           Serial.print(" | Loadcell Weight: ");
           Serial.print(weight, 2);
           Serial.println(" g");
-          /*
+          
           Serial.print("Hall Sensor: ");
           Serial.print(hallValue);
           Serial.print(" | Glass Present: ");
           Serial.println(glassPresent ? "YES" : "NO");
-          
+          /*
           // BLE Test Status
           Serial.print("BLE Connected: ");
           Serial.print(bleConnected ? "YES" : "NO");
