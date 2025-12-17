@@ -20,7 +20,7 @@ Adafruit_FlashTransport_QSPI flashTransport;
 const int HALL_SENSOR_PIN = A0;
 const int LOADCELL_DOUT_PIN = D2;
 const int LOADCELL_SCK_PIN = D3;
-const int NEO_PIXEL_PIN = D1;
+const int NEO_PIXEL_PIN = D7;
 
 // NeoPixel configuration
 #define NUM_NEOPIXELS 10
@@ -68,8 +68,8 @@ float totalConsumed = 0.0;
 
 // Hysteresis prevents "flickering" events
 // TODO: Calibrate these thresholds experimentally
-const int THRESHOLD_HIGH = 600; 
-const int THRESHOLD_LOW = 500;
+const int THRESHOLD_HIGH = 470; 
+const int THRESHOLD_LOW = 466;
 
 // Duty Cycle Intervals
 const int FAST_POLL_MS = 200;   // Check fast when interacting
@@ -123,10 +123,18 @@ void heartbeatCallback(TimerHandle_t xTimer) {
 }
 
 float getWeight() {
-  // Check if load cell is ready
+  // Wait for load cell to be ready (with timeout)
+  // HX711 needs time between conversions (10Hz = 100ms, 80Hz = 12.5ms)
+  int timeoutMs = 200;
+  int waited = 0;
+  while (!loadcell.is_ready() && waited < timeoutMs) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    waited += 10;
+  }
+
   if (loadcell.is_ready()) {
-    // Get average of 10 readings (already calibrated by set_scale)
-    float weight = loadcell.get_units(10);
+    // Get average of 3 readings (already calibrated by set_scale)
+    float weight = loadcell.get_units(2);
     return weight;
   } else {
     Serial.println("Load cell not ready");
@@ -143,6 +151,8 @@ static bool performLoadcellStabilityCheck(float &outWeight) {
   }
 
   float x0 = getWeight();
+  Serial.print("x0: ");
+  Serial.println(x0);
   if (isnan(x0)) { outWeight = NAN; return false; }
   float last = x0;
   float sumDelta = 0.0f;
@@ -150,6 +160,10 @@ static bool performLoadcellStabilityCheck(float &outWeight) {
   for (int i = 1; i < STABILITY_SAMPLES; i++) {
     vTaskDelay(pdMS_TO_TICKS(50));
     float w = getWeight();
+    Serial.print("x");
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.println(w);
     if (isnan(w)) { outWeight = NAN; return false; }
     float d = fabsf(w - last);
     sumDelta += d;
@@ -157,6 +171,8 @@ static bool performLoadcellStabilityCheck(float &outWeight) {
   }
 
   float avgDelta = sumDelta / (STABILITY_SAMPLES - 1);
+  Serial.print("Avg Delta: ");
+  Serial.println(avgDelta);
   outWeight = last;
 
   // Consider stable only when weight is positive and above the bottom-plate threshold (on-table)
@@ -195,10 +211,10 @@ void loadcellStabilityTask(void *pvParameters) {
 bool isGlassPresent() {
   int val = analogRead(HALL_SENSOR_PIN);
   // In hysteresis zone, keep previous state. For the inital call, use middle of threshold as a binary state.
-  static bool lastState = (val >= (THRESHOLD_HIGH + THRESHOLD_LOW) / 2);
+  static bool lastState = (val < (THRESHOLD_HIGH + THRESHOLD_LOW) / 2);
 
-  if (val > THRESHOLD_HIGH) lastState = true;
-  else if (val < THRESHOLD_LOW) lastState = false;
+  if (val > THRESHOLD_HIGH) lastState = false;
+  else if (val < THRESHOLD_LOW) lastState = true;
 
   return lastState;
 }
@@ -800,7 +816,7 @@ void loop() {
           // Test hall sensor
           int hallValue = analogRead(HALL_SENSOR_PIN);
           bool glassPresent = isGlassPresent();*/
-
+          
           // Print all values to serial monitor
           Serial.print(" | Loadcell Stable: ");
           Serial.print(isAnyStable ? "YES" : "NO");
