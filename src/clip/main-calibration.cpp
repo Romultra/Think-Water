@@ -238,8 +238,6 @@ void performHallMeasurement(int32_t* outMin, int32_t* outMax, int32_t* outAvg) {
 
 void setup() {
     Serial.begin(115200);
-    while (!Serial) { delay(10); }
-    delay(500);
 
     Serial.println("\n========================================");
     Serial.println("  Coaster Calibration Mode");
