@@ -1391,7 +1391,7 @@ void drawMainScreen() {
         displayCache.initialized = true;
     }
 
-    // Update progress percentage if changed
+    // Update progress percentage and bar if changed
     if (fullRedraw || fabsf(progress - displayCache.lastProgress) > 0.5f) {
         // Clear progress area
         display.fillRect(20, 55, 136, 32, RGB565(15, 20, 30));
@@ -1419,24 +1419,11 @@ void drawMainScreen() {
 
         display.setFont(); // Return to default font
 
-        displayCache.lastProgress = progress;
-    }
-
-    // Update progress bar if changed
-    if (fullRedraw || fabsf(progress - displayCache.lastProgress) > 0.5f) {
+        // Draw progress bar
         int16_t barWidth = 150;
         int16_t barHeight = 12;
         int16_t barX = (176 - barWidth) / 2;
         int16_t barY = 90;
-
-        uint16_t progressColor;
-        if (progress < 30) {
-            progressColor = RGB565(255, 100, 100);
-        } else if (progress < 70) {
-            progressColor = RGB565(255, 200, 100);
-        } else {
-            progressColor = RGB565(100, 255, 150);
-        }
 
         display.drawRect(barX - 1, barY - 1, barWidth + 2, barHeight + 2, RGB565(100, 150, 200));
         display.fillRect(barX, barY, barWidth, barHeight, RGB565(30, 40, 50));
@@ -1445,6 +1432,8 @@ void drawMainScreen() {
         if (fillWidth > 0) {
             display.fillRect(barX, barY, fillWidth, barHeight, progressColor);
         }
+
+        displayCache.lastProgress = progress;
     }
 
     // Update consumption details if changed
