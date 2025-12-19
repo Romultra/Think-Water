@@ -117,8 +117,7 @@ enum class DebugOption {
 #define COASTER_SERVICE_UUID        "19B10010-E8F2-537E-4F6C-D104768A1214"
 #define CONSUMPTION_CHAR_UUID       "19B10011-E8F2-537E-4F6C-D104768A1214"
 #define COMMAND_CHAR_UUID           "19B10012-E8F2-537E-4F6C-D104768A1214"
-#define GOAL_CHAR_UUID              "19B10013-E8F2-537E-4F6C-D104768A1214"
-#define TOTAL_SYNC_CHAR_UUID        "19B10014-E8F2-537E-4F6C-D104768A1214"
+#define PROGRESS_CHAR_UUID          "19B10014-E8F2-537E-4F6C-D104768A1214"
 #define COASTER_MFG_COMPANY_ID      0xFFFF
 
 // ============================================================================
@@ -243,17 +242,14 @@ BLEState bleState = BLEState::IDLE;
 BLEClient* pClient = nullptr;
 BLERemoteCharacteristic* pConsumptionChar = nullptr;
 BLERemoteCharacteristic* pCommandChar = nullptr;
-BLERemoteCharacteristic* pGoalChar = nullptr;
-BLERemoteCharacteristic* pTotalSyncChar = nullptr;
+BLERemoteCharacteristic* pProgressChar = nullptr;
 BLEScan* pBLEScan = nullptr;
 BLEAdvertisedDevice* coasterDevice = nullptr;
 volatile bool scanInProgress = false;
 volatile bool coasterFound = false;
 volatile bool coasterHasData = false;
 bool alertPending = false;
-bool goalPending = false;
-float pendingGoal = 0.0f;
-bool totalSyncPending = false;
+bool progressPending = false;
 uint32_t connectStartTime = 0;
 
 // Hydration tracking
@@ -339,8 +335,7 @@ class MyClientCallback : public BLEClientCallbacks {
         // Clear characteristic pointers - they're invalid after disconnect
         pConsumptionChar = nullptr;
         pCommandChar = nullptr;
-        pGoalChar = nullptr;
-        pTotalSyncChar = nullptr;
+        pProgressChar = nullptr;
     }
 };
 
@@ -377,16 +372,14 @@ class MyScanCallbacks : public BLEAdvertisedDeviceCallbacks {
             coasterFound = true;
 
             // Only stop scan if we need to connect
-            bool shouldConnect = hasData || alertPending || goalPending || totalSyncPending;
+            bool shouldConnect = hasData || alertPending || progressPending;
             if (shouldConnect && scanInProgress) {
                 Serial.print("BLE: Coaster found, need to connect (data=");
                 Serial.print(hasData ? "Y" : "N");
                 Serial.print(" alert=");
                 Serial.print(alertPending ? "Y" : "N");
-                Serial.print(" goal=");
-                Serial.print(goalPending ? "Y" : "N");
-                Serial.print(" totalSync=");
-                Serial.print(totalSyncPending ? "Y" : "N");
+                Serial.print(" progress=");
+                Serial.print(progressPending ? "Y" : "N");
                 Serial.println(")");
                 scanInProgress = false;
                 pBLEScan->stop();
@@ -844,10 +837,9 @@ bool connectToCoaster() {
 
     pConsumptionChar = pRemoteService->getCharacteristic(CONSUMPTION_CHAR_UUID);
     pCommandChar = pRemoteService->getCharacteristic(COMMAND_CHAR_UUID);
-    pGoalChar = pRemoteService->getCharacteristic(GOAL_CHAR_UUID);
-    pTotalSyncChar = pRemoteService->getCharacteristic(TOTAL_SYNC_CHAR_UUID);
+    pProgressChar = pRemoteService->getCharacteristic(PROGRESS_CHAR_UUID);
 
-    if (pConsumptionChar == nullptr || pCommandChar == nullptr || pGoalChar == nullptr || pTotalSyncChar == nullptr) {
+    if (pConsumptionChar == nullptr || pCommandChar == nullptr || pProgressChar == nullptr) {
         Serial.println("BLE: Characteristics not found");
         pClient->disconnect();
         return false;
@@ -878,23 +870,20 @@ bool sendCommand(uint8_t cmd) {
     return true;
 }
 
-bool sendGoal(float goalML) {
-    if (bleState != BLEState::CONNECTED || pGoalChar == nullptr) {
+bool sendProgress() {
+    if (bleState != BLEState::CONNECTED || pProgressChar == nullptr) {
         return false;
     }
-    uint8_t data[4];
-    memcpy(data, &goalML, 4);
-    pGoalChar->writeValue(data, 4, false);
-    return true;
-}
+    // Calculate progress percentage (0.0-1.0)
+    float progress = 0.0f;
+    if (hydrationState.dailyGoalML > 0) {
+        progress = hydrationState.totalConsumedML / hydrationState.dailyGoalML;
+        if (progress > 1.0f) progress = 1.0f;
+    }
 
-bool sendTotalSync(float totalML) {
-    if (bleState != BLEState::CONNECTED || pTotalSyncChar == nullptr) {
-        return false;
-    }
     uint8_t data[4];
-    memcpy(data, &totalML, 4);
-    pTotalSyncChar->writeValue(data, 4, false);
+    memcpy(data, &progress, 4);
+    pProgressChar->writeValue(data, 4, false);
     return true;
 }
 
@@ -924,7 +913,7 @@ void processBLEState() {
             bleState = BLEState::IDLE;
             break;
 
-        case BLEState::CONNECTED:
+        case BLEState::CONNECTED: {
             // Check for unexpected disconnect
             if (pClient == nullptr || !pClient->isConnected()) {
                 Serial.println("BLE: Unexpected disconnect, resuming scan");
@@ -932,23 +921,31 @@ void processBLEState() {
                 break;
             }
 
-            // Send pending goal first
-            if (goalPending) {
-                if (sendGoal(pendingGoal)) {
-                    Serial.print("BLE: Sent goal ");
-                    Serial.println(pendingGoal);
-                    goalPending = false;
-                    hydrationState.goalSentToCoaster = true;
-                }
+            // Always send progress on every connection to ensure coaster is up-to-date
+            // This handles the case where coaster was powered down and missed updates
+            static uint32_t lastConnectionTime = 0;
+            if (millis() - lastConnectionTime > 1000) {  // Debounce multiple calls
+                lastConnectionTime = millis();
+                progressPending = true;
+                Serial.println("BLE: New connection - queuing progress sync");
             }
 
-            // Send pending total sync
-            if (totalSyncPending) {
-                if (sendTotalSync(hydrationState.totalConsumedML)) {
-                    Serial.print("BLE: Sent total sync ");
-                    Serial.print(hydrationState.totalConsumedML);
-                    Serial.println(" ml");
-                    totalSyncPending = false;
+            // Send pending progress percentage
+            if (progressPending) {
+                if (sendProgress()) {
+                    float progress = 0.0f;
+                    if (hydrationState.dailyGoalML > 0) {
+                        progress = hydrationState.totalConsumedML / hydrationState.dailyGoalML;
+                    }
+                    Serial.print("BLE: Sent progress ");
+                    Serial.print(progress * 100.0f, 1);
+                    Serial.print("% (");
+                    Serial.print(hydrationState.totalConsumedML, 0);
+                    Serial.print("/");
+                    Serial.print(hydrationState.dailyGoalML, 0);
+                    Serial.println(" ml)");
+                    progressPending = false;
+                    hydrationState.goalSentToCoaster = true;
                 }
             }
 
@@ -965,12 +962,13 @@ void processBLEState() {
 
             // Wait for potential incoming data, then disconnect
             if (millis() - connectStartTime > POST_CONNECT_DELAY_MS) {
-                if (!goalPending && !alertPending && !totalSyncPending) {
+                if (!progressPending && !alertPending) {
                     Serial.println("BLE: Operations complete, disconnecting");
                     disconnectFromCoaster();
                 }
             }
             break;
+        }
 
         case BLEState::DISCONNECTING:
             // Wait for disconnect to complete, then resume scanning
@@ -1026,9 +1024,7 @@ void onNewDay() {
     hydrationState.remindersSent = 0;
     hydrationState.goalSentToCoaster = false;
     hydrationState.dailyGoalML = calculateDailyGoal();
-    pendingGoal = hydrationState.dailyGoalML;
-    goalPending = true;
-    totalSyncPending = true;  // Sync the reset total to coaster
+    progressPending = true;  // Sync the reset progress to coaster
 
     // Reset consumption in NVS flash for new day
     preferences.begin("coaster", false);
@@ -1824,9 +1820,7 @@ void handleEncoderInput() {
 
                 // Calculate initial daily goal
                 hydrationState.dailyGoalML = calculateDailyGoal();
-                pendingGoal = hydrationState.dailyGoalML;
-                goalPending = true;
-                totalSyncPending = true;  // Sync initial total (0.0) to coaster
+                progressPending = true;  // Sync initial progress (0%) to coaster
                 break;
 
             case Screen::SETTINGS_AGE:
@@ -1846,9 +1840,7 @@ void handleEncoderInput() {
                 lastDisplayUpdate = 0;
                 // Recalculate goal with new parameters
                 hydrationState.dailyGoalML = calculateDailyGoal();
-                pendingGoal = hydrationState.dailyGoalML;
-                goalPending = true;
-                totalSyncPending = true;  // Sync current total to coaster
+                progressPending = true;  // Sync updated progress to coaster
                 break;
 
             case Screen::SETTINGS_HOUR:
@@ -1921,10 +1913,8 @@ void handleEncoderInput() {
                         break;
 
                     case DebugOption::SEND_GOAL:
-                        Serial.println("DEBUG: Sending goal to coaster");
-                        pendingGoal = hydrationState.dailyGoalML;
-                        goalPending = true;
-                        totalSyncPending = true;  // Also sync total when sending goal
+                        Serial.println("DEBUG: Sending progress to coaster");
+                        progressPending = true;
                         currentScreen = Screen::MAIN_DISPLAY;
                         lastDisplayUpdate = 0;
                         break;
@@ -1976,9 +1966,7 @@ void setup() {
 
         // Calculate daily goal
         hydrationState.dailyGoalML = calculateDailyGoal();
-        pendingGoal = hydrationState.dailyGoalML;
-        goalPending = true;
-        totalSyncPending = true;  // Sync loaded total to coaster on startup
+        progressPending = true;  // Sync loaded progress to coaster on startup
     }
 
     // Take initial sensor reading
@@ -2038,19 +2026,18 @@ void loop() {
             consumptionReceived = false;
             hydrationState.totalConsumedML += latestConsumption.amountML;
             saveConsumption(latestConsumption.amountML);  // Save to NVS flash
-            totalSyncPending = true;  // Queue sync of updated total back to coaster
-            Serial.printf("Total consumed: %.1f / %.1f mL (sync pending)\n",
+            progressPending = true;  // Queue sync of updated progress back to coaster
+            Serial.printf("Total consumed: %.1f / %.1f mL (progress sync pending)\n",
                          hydrationState.totalConsumedML,
                          hydrationState.dailyGoalML);
             lastDisplayUpdate = 0; // Force display update
         }
 
-        // Queue goal if not yet sent
+        // Queue progress if not yet sent
         if (rtcInitialized && !hydrationState.goalSentToCoaster &&
             hydrationState.dailyGoalML <= 0) {
             hydrationState.dailyGoalML = calculateDailyGoal();
-            pendingGoal = hydrationState.dailyGoalML;
-            goalPending = true;
+            progressPending = true;
         }
 
         // Check trajectory periodically during active hours

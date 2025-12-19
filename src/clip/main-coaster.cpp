@@ -16,8 +16,7 @@ Adafruit_FlashTransport_QSPI flashTransport;
 #define COASTER_SERVICE_UUID        "19B10010-E8F2-537E-4F6C-D104768A1214"
 #define CONSUMPTION_CHAR_UUID       "19B10011-E8F2-537E-4F6C-D104768A1214"  // Notify consumption events
 #define COMMAND_CHAR_UUID           "19B10012-E8F2-537E-4F6C-D104768A1214"  // Write commands from base
-#define GOAL_CHAR_UUID              "19B10013-E8F2-537E-4F6C-D104768A1214"  // Write hydration goal
-#define TOTAL_SYNC_CHAR_UUID        "19B10014-E8F2-537E-4F6C-D104768A1214"  // Write total consumed sync from base
+#define PROGRESS_CHAR_UUID          "19B10014-E8F2-537E-4F6C-D104768A1214"  // Write progress percentage (0.0-1.0) from base
 
 const int HALL_SENSOR_PIN = A0;
 const int LOADCELL_DOUT_PIN = D2;
@@ -54,8 +53,7 @@ const long LOADCELL_RAW_DEVIATION_THRESHOLD = 200; // raw units: max avg deviati
 BLEService coasterService(COASTER_SERVICE_UUID);
 BLECharacteristic consumptionChar(CONSUMPTION_CHAR_UUID);
 BLECharacteristic commandChar(COMMAND_CHAR_UUID);
-BLECharacteristic goalChar(GOAL_CHAR_UUID);
-BLECharacteristic totalSyncChar(TOTAL_SYNC_CHAR_UUID);
+BLECharacteristic progressChar(PROGRESS_CHAR_UUID);
 
 bool bleConnected = false;
 volatile bool dataPendingToSend = false;
@@ -69,8 +67,7 @@ void updateAdvertisingData(bool hasPendingData);
 
 bool glassChanged = false;
 bool wasPickedUp = false;  // Track if coaster was in air (for CHECK_FOR_DRINK)
-float hydrationGoal = 2000.0; // Default 2000ml
-float totalConsumed = 0; // Total consumed in grams (ml) - synced from base station
+float progressPercentage = 0.0f; // Hydration progress (0.0-1.0) synced from base station
 
 // Hysteresis prevents "flickering" events
 const int THRESHOLD_HIGH = 466;  // Above this = no glass (calibrated)
@@ -371,25 +368,14 @@ void command_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* 
   xQueueSend(eventQueue, &evt, 0);
 }
 
-// Goal Characteristic Write Callback
-void goal_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+// Progress Characteristic Write Callback
+void progress_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   if (len == 4) {
-    // Expect 4 bytes for float (hydration goal in ml)
-    memcpy(&hydrationGoal, data, 4);
-    Serial.print("Hydration goal updated: ");
-    Serial.print(hydrationGoal);
-    Serial.println(" ml");
-  }
-}
-
-// Total Sync Characteristic Write Callback
-void total_sync_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
-  if (len == 4) {
-    // Expect 4 bytes for float (total consumed in ml)
-    memcpy(&totalConsumed, data, 4);
-    Serial.print("Total consumed synced from base: ");
-    Serial.print(totalConsumed);
-    Serial.println(" ml");
+    // Expect 4 bytes for float (progress percentage 0.0-1.0)
+    memcpy(&progressPercentage, data, 4);
+    Serial.print("Progress synced from base: ");
+    Serial.print(progressPercentage * 100.0f, 1);
+    Serial.println("%");
   }
 }
 
@@ -438,20 +424,13 @@ void setupBLE() {
   commandChar.setWriteCallback(command_write_callback);
   commandChar.setMaxLen(4); // command code + optional data
   commandChar.begin();
-  
-  // Configure Goal Characteristic (Write only)
-  goalChar.setProperties(CHR_PROPS_WRITE);
-  goalChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
-  goalChar.setWriteCallback(goal_write_callback);
-  goalChar.setFixedLen(4); // float value (ml)
-  goalChar.begin();
 
-  // Configure Total Sync Characteristic (Write only)
-  totalSyncChar.setProperties(CHR_PROPS_WRITE);
-  totalSyncChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
-  totalSyncChar.setWriteCallback(total_sync_write_callback);
-  totalSyncChar.setFixedLen(4); // float value (ml)
-  totalSyncChar.begin();
+  // Configure Progress Characteristic (Write only)
+  progressChar.setProperties(CHR_PROPS_WRITE);
+  progressChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  progressChar.setWriteCallback(progress_write_callback);
+  progressChar.setFixedLen(4); // float value (0.0-1.0)
+  progressChar.begin();
   
   // Setup advertising
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
@@ -583,7 +562,8 @@ void ledFeedbackTask(void *pvParameters) {
     // Acquire mutex to prevent concurrent LED access
     if (xSemaphoreTake(ledMutex, portMAX_DELAY) != pdTRUE) continue;
 
-    float progress = totalConsumed / hydrationGoal;
+    // Use progress percentage directly from base station sync
+    float progress = progressPercentage;
     if (!isfinite(progress)) progress = 0.0f;
     progress = constrain(progress, 0.0f, 1.0f);
 
