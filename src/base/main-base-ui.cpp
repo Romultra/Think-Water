@@ -107,8 +107,11 @@ enum class MenuOption {
 enum class DebugOption {
     BACK_TO_MENU,
     SEND_ALERT,
-    SEND_GOAL,
-    TRIGGER_DAY_CHANGE
+    TRIGGER_DAY_CHANGE,
+    SET_PROGRESS_40,
+    SET_PROGRESS_100,
+    ERASE_CONFIG,
+    SEND_PROGRESS
 };
 
 // ============================================================================
@@ -1606,6 +1609,7 @@ void drawDebugMenu() {
 
     // Only clear screen on first draw or screen change
     static DebugOption lastSelectedDebugOpt = DebugOption::BACK_TO_MENU;
+    static int lastScrollOffset = 0;
     bool fullRedraw = (lastScreen != currentScreen);
 
     if (fullRedraw) {
@@ -1630,38 +1634,71 @@ void drawDebugMenu() {
     const char* options[] = {
         "Back to Menu",
         "Send Alert",
-        "Send Goal",
-        "New Day"
+        "New Day",
+        "Set 40%",
+        "Set 100%",
+        "Erase Config",
+        "Sync Progress"
     };
 
+    const int totalOptions = 7;
+    const int maxVisibleOptions = 4;  // Maximum options that fit on screen
     int16_t optionY = 40;
     int16_t optionHeight = 28;
 
-    // Only redraw if selection changed or full redraw needed
-    if (fullRedraw || selectedDebugOption != lastSelectedDebugOpt) {
-        for (int i = 0; i < 4; i++) {
-            bool isSelected = (i == (int)selectedDebugOption);
-            bool wasSelected = (i == (int)lastSelectedDebugOpt);
+    // Calculate scroll offset to keep selected option visible
+    int selectedIndex = (int)selectedDebugOption;
+    int scrollOffset = 0;
 
-            // Only redraw this option if its state changed or full redraw
-            if (fullRedraw || isSelected != wasSelected) {
-                // Clear the option area first
-                display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(15, 20, 30));
+    if (selectedIndex >= maxVisibleOptions) {
+        scrollOffset = selectedIndex - maxVisibleOptions + 1;
+    }
 
-                // Draw selection background if selected
-                if (isSelected) {
-                    display.fillRect(5, optionY + i * optionHeight, 166, 25, RGB565(150, 50, 50));
-                    display.drawRect(5, optionY + i * optionHeight, 166, 25, RGB565(255, 100, 100));
-                }
+    // Limit scroll to prevent empty space at bottom
+    int maxScroll = totalOptions - maxVisibleOptions;
+    if (scrollOffset > maxScroll) {
+        scrollOffset = maxScroll;
+    }
 
-                // Draw text
-                display.setTextSize(2);
-                display.setTextColor(isSelected ? COLOR_WHITE : RGB565(180, 180, 180));
-                display.setCursor(15, optionY + i * optionHeight + 5);
-                display.print(options[i]);
+    // Only redraw if selection changed, scroll changed, or full redraw needed
+    if (fullRedraw || selectedDebugOption != lastSelectedDebugOpt || scrollOffset != lastScrollOffset) {
+        // Clear options area
+        display.fillRect(0, optionY, 176, maxVisibleOptions * optionHeight, RGB565(15, 20, 30));
+
+        // Draw visible options
+        for (int i = 0; i < maxVisibleOptions && (i + scrollOffset) < totalOptions; i++) {
+            int optionIndex = i + scrollOffset;
+            bool isSelected = (optionIndex == selectedIndex);
+            int16_t yPos = optionY + i * optionHeight;
+
+            // Draw selection background if selected
+            if (isSelected) {
+                display.fillRect(5, yPos, 166, 25, RGB565(150, 50, 50));
+                display.drawRect(5, yPos, 166, 25, RGB565(255, 100, 100));
             }
+
+            // Draw text
+            display.setTextSize(2);
+            display.setTextColor(isSelected ? COLOR_WHITE : RGB565(180, 180, 180));
+            display.setCursor(15, yPos + 5);
+            display.print(options[optionIndex]);
         }
+
+        // Draw scroll indicators
+        if (scrollOffset > 0) {
+            // Up arrow
+            display.fillTriangle(88, 35, 83, 39, 93, 39, RGB565(200, 200, 200));
+        }
+        if (scrollOffset < maxScroll) {
+            // Down arrow
+            display.fillTriangle(88, optionY + maxVisibleOptions * optionHeight + 2,
+                               83, optionY + maxVisibleOptions * optionHeight - 2,
+                               93, optionY + maxVisibleOptions * optionHeight - 2,
+                               RGB565(200, 200, 200));
+        }
+
         lastSelectedDebugOpt = selectedDebugOption;
+        lastScrollOffset = scrollOffset;
     }
 }
 
@@ -1769,9 +1806,9 @@ void handleEncoderInput() {
 
             case Screen::DEBUG_MENU:
                 if (delta > 0) {
-                    selectedDebugOption = (DebugOption)(((int)selectedDebugOption + 1) % 4);
+                    selectedDebugOption = (DebugOption)(((int)selectedDebugOption + 1) % 7);
                 } else if (delta < 0) {
-                    selectedDebugOption = (DebugOption)(((int)selectedDebugOption + 3) % 4);
+                    selectedDebugOption = (DebugOption)(((int)selectedDebugOption + 6) % 7);
                 }
                 lastDisplayUpdate = 0;
                 break;
@@ -1912,8 +1949,8 @@ void handleEncoderInput() {
                         lastDisplayUpdate = 0;
                         break;
 
-                    case DebugOption::SEND_GOAL:
-                        Serial.println("DEBUG: Sending progress to coaster");
+                    case DebugOption::SEND_PROGRESS:
+                        Serial.println("DEBUG: Syncing progress percentage to coaster");
                         progressPending = true;
                         currentScreen = Screen::MAIN_DISPLAY;
                         lastDisplayUpdate = 0;
@@ -1924,6 +1961,81 @@ void handleEncoderInput() {
                         onNewDay();
                         currentScreen = Screen::MAIN_DISPLAY;
                         lastDisplayUpdate = 0;
+                        break;
+
+                    case DebugOption::SET_PROGRESS_40:
+                        Serial.println("DEBUG: Setting progress to 40%");
+                        if (hydrationState.dailyGoalML > 0) {
+                            // Calculate consumption needed for 40%
+                            float target = hydrationState.dailyGoalML * 0.4f;
+                            float toAdd = target - hydrationState.totalConsumedML;
+
+                            if (toAdd > 0) {
+                                hydrationState.totalConsumedML = target;
+                                saveConsumption(toAdd);
+                                Serial.printf("Added %.1f mL to reach 40%% (%.1f / %.1f mL)\n",
+                                             toAdd, hydrationState.totalConsumedML, hydrationState.dailyGoalML);
+                            } else {
+                                // Already past 40%, just set it
+                                hydrationState.totalConsumedML = target;
+                                preferences.begin("coaster", false);
+                                preferences.putFloat("consumedToday", hydrationState.totalConsumedML);
+                                preferences.end();
+                                Serial.printf("Set to 40%% (%.1f / %.1f mL)\n",
+                                             hydrationState.totalConsumedML, hydrationState.dailyGoalML);
+                            }
+                            progressPending = true;
+                            lastDisplayUpdate = 0;
+                        }
+                        currentScreen = Screen::MAIN_DISPLAY;
+                        break;
+
+                    case DebugOption::SET_PROGRESS_100:
+                        Serial.println("DEBUG: Setting progress to 100%");
+                        if (hydrationState.dailyGoalML > 0) {
+                            // Calculate consumption needed for 100%
+                            float target = hydrationState.dailyGoalML;
+                            float toAdd = target - hydrationState.totalConsumedML;
+
+                            if (toAdd > 0) {
+                                hydrationState.totalConsumedML = target;
+                                saveConsumption(toAdd);
+                                Serial.printf("Added %.1f mL to reach 100%% (%.1f / %.1f mL)\n",
+                                             toAdd, hydrationState.totalConsumedML, hydrationState.dailyGoalML);
+                            } else {
+                                // Already at goal, just set it
+                                hydrationState.totalConsumedML = target;
+                                preferences.begin("coaster", false);
+                                preferences.putFloat("consumedToday", hydrationState.totalConsumedML);
+                                preferences.end();
+                                Serial.printf("Set to 100%% (%.1f / %.1f mL)\n",
+                                             hydrationState.totalConsumedML, hydrationState.dailyGoalML);
+                            }
+                            progressPending = true;
+                            lastDisplayUpdate = 0;
+                        }
+                        currentScreen = Screen::MAIN_DISPLAY;
+                        break;
+
+                    case DebugOption::ERASE_CONFIG:
+                        Serial.println("DEBUG: Erasing user configuration");
+                        // Clear all NVS data
+                        preferences.begin("coaster", false);
+                        preferences.clear();
+                        preferences.end();
+                        Serial.println("NVS configuration erased");
+
+                        // Reset to defaults
+                        userConfig = {35, 0, 70, false, false};
+                        hydrationState.totalConsumedML = 0.0f;
+                        hydrationState.dailyGoalML = 0.0f;
+
+                        // Go to setup screen
+                        currentScreen = Screen::SETUP_AGE;
+                        setupCache.initialized = false;
+                        displayCache.initialized = false;
+                        lastDisplayUpdate = 0;
+                        Serial.println("Device reset to initial setup state");
                         break;
                 }
                 break;
