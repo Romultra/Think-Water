@@ -17,6 +17,7 @@ Adafruit_FlashTransport_QSPI flashTransport;
 #define CONSUMPTION_CHAR_UUID       "19B10011-E8F2-537E-4F6C-D104768A1214"  // Notify consumption events
 #define COMMAND_CHAR_UUID           "19B10012-E8F2-537E-4F6C-D104768A1214"  // Write commands from base
 #define GOAL_CHAR_UUID              "19B10013-E8F2-537E-4F6C-D104768A1214"  // Write hydration goal
+#define TOTAL_SYNC_CHAR_UUID        "19B10014-E8F2-537E-4F6C-D104768A1214"  // Write total consumed sync from base
 
 const int HALL_SENSOR_PIN = A0;
 const int LOADCELL_DOUT_PIN = D2;
@@ -54,6 +55,7 @@ BLEService coasterService(COASTER_SERVICE_UUID);
 BLECharacteristic consumptionChar(CONSUMPTION_CHAR_UUID);
 BLECharacteristic commandChar(COMMAND_CHAR_UUID);
 BLECharacteristic goalChar(GOAL_CHAR_UUID);
+BLECharacteristic totalSyncChar(TOTAL_SYNC_CHAR_UUID);
 
 bool bleConnected = false;
 volatile bool dataPendingToSend = false;
@@ -68,10 +70,9 @@ void updateAdvertisingData(bool hasPendingData);
 bool glassChanged = false;
 bool wasPickedUp = false;  // Track if coaster was in air (for CHECK_FOR_DRINK)
 float hydrationGoal = 2000.0; // Default 2000ml
-float totalConsumed = 0; // Total consumed in grams (ml) TODO: Remove dummy value
+float totalConsumed = 0; // Total consumed in grams (ml) - synced from base station
 
 // Hysteresis prevents "flickering" events
-// TODO: Calibrate these thresholds experimentally
 const int THRESHOLD_HIGH = 466;  // Above this = no glass (calibrated)
 const int THRESHOLD_LOW = 458;   // Below this = glass present (calibrated)
 
@@ -381,6 +382,17 @@ void goal_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* dat
   }
 }
 
+// Total Sync Characteristic Write Callback
+void total_sync_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  if (len == 4) {
+    // Expect 4 bytes for float (total consumed in ml)
+    memcpy(&totalConsumed, data, 4);
+    Serial.print("Total consumed synced from base: ");
+    Serial.print(totalConsumed);
+    Serial.println(" ml");
+  }
+}
+
 // Update advertising data with current data pending flag
 // This allows the base station to know if the coaster has data to send
 void updateAdvertisingData(bool hasPendingData) {
@@ -433,6 +445,13 @@ void setupBLE() {
   goalChar.setWriteCallback(goal_write_callback);
   goalChar.setFixedLen(4); // float value (ml)
   goalChar.begin();
+
+  // Configure Total Sync Characteristic (Write only)
+  totalSyncChar.setProperties(CHR_PROPS_WRITE);
+  totalSyncChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  totalSyncChar.setWriteCallback(total_sync_write_callback);
+  totalSyncChar.setFixedLen(4); // float value (ml)
+  totalSyncChar.begin();
   
   // Setup advertising
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
@@ -723,7 +742,7 @@ void determineInitialState() {
 
 void setup() {
   Serial.begin(115200);
-  //while (!Serial) { delay(10); } // TODO: Remove for production
+  //while (!Serial) { delay(10); }
   //delay(500);
 
   // Configure battery charging current to 100mA
@@ -774,7 +793,7 @@ void setup() {
   heartbeatTimer = xTimerCreate("Heartbeat", pdMS_TO_TICKS(SLOW_POLL_MS), pdTRUE, 0, heartbeatCallback);
   xTimerStart(heartbeatTimer, 0);
 
-  // Disable when testing, TODO: Enable when ready
+  // Disable when testing
   determineInitialState(); 
 
   Serial.println("Coaster Clip Main Setup");
@@ -858,7 +877,7 @@ void loop() {
                 } else {
                   float drinkAmount = prevWeight - weight;
                   if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
-                    totalConsumed += drinkAmount;
+                    // Don't update totalConsumed here - base station will sync it back
                     Serial.print("Drink detected: ");
                     Serial.print(drinkAmount);
                     Serial.println(" g");
