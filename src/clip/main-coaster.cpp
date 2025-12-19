@@ -31,7 +31,7 @@ Adafruit_NeoPixel strip(NUM_NEOPIXELS, NEO_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 HX711 loadcell;
 const float LOADCELL_SCALE = -373.3692f;  // Calibrated: raw units per gram
 const long LOADCELL_OFFSET = -57432;       // Calibrated: raw value at 0g
-const float THRESHOLD_DRINK_AMOUNT = 5.0; // Minimum weight change (grams) to register a drink event
+const float THRESHOLD_DRINK_AMOUNT = 4.0; // Minimum weight change (grams) to register a drink event
 float prevWeight = NAN; // NAN until first valid measurement
 
 // Loadcell stability results (updated by background task)
@@ -43,12 +43,11 @@ float prevWeight = NAN; // NAN until first valid measurement
 volatile bool loadcellStable = false;        // Full stability (magnitude + deviation)
 volatile bool loadcellMagnitudeOk = false;   // Quick magnitude check (on table)
 volatile float loadcellLastWeight = 0.0f;
-volatile bool fastPeriodActive = false;      // Track timer period for stability task
 
 // Thresholds for loadcell-based stability
-const int STABILITY_SAMPLES = 6;
+const int STABILITY_SAMPLES = 5;
 const float LOADCELL_BOTTOM_PLATE_THRESHOLD = -54.0f; // grams: weight of bottom plate/contact to consider "on table"
-const long LOADCELL_RAW_DEVIATION_THRESHOLD = 100; // raw units: max avg deviation to consider stable (~0.5g)
+const long LOADCELL_RAW_DEVIATION_THRESHOLD = 200; // raw units: max avg deviation to consider stable (~0.5g)
 
 // BLE Objects
 BLEService coasterService(COASTER_SERVICE_UUID);
@@ -67,21 +66,62 @@ uint8_t mfgData[3] = {0xFF, 0xFF, 0x00};
 void updateAdvertisingData(bool hasPendingData);
 
 bool glassChanged = false;
+bool wasPickedUp = false;  // Track if coaster was in air (for CHECK_FOR_DRINK)
 float hydrationGoal = 2000.0; // Default 2000ml
-float totalConsumed = 2000.0; // Total consumed in grams (ml) TODO: Remove dummy value
+float totalConsumed = 0; // Total consumed in grams (ml) TODO: Remove dummy value
 
 // Hysteresis prevents "flickering" events
 // TODO: Calibrate these thresholds experimentally
-const int THRESHOLD_HIGH = 464;  // Above this = no glass (calibrated)
-const int THRESHOLD_LOW = 460;   // Below this = glass present (calibrated)
+const int THRESHOLD_HIGH = 466;  // Above this = no glass (calibrated)
+const int THRESHOLD_LOW = 458;   // Below this = glass present (calibrated)
+
+// ============================================================================
+// TIMING CONSTRAINTS AND STATE MACHINE DESIGN RATIONALE
+// ============================================================================
+//
+// HX711 Load Cell Performance:
+//   - Maximum sample rate: 10Hz (one reading per 100ms minimum)
+//   - waitForLoadcell() timeout: 200ms per reading
+//
+// Stability Check Timing Costs:
+//   - Magnitude check:  1 reading  (~100ms typical, 200ms worst case)
+//   - Deviation check:  5 readings (~500ms typical, 1000ms worst case)
+//   - TOTAL when on table: ~600ms typical, ~1400ms worst case
+//
+// State-Based Polling Strategy:
+//   - MOVING states (in air):
+//       * Magnitude check FAILS immediately
+//       * Deviation check SKIPPED (see loadcellStabilityTask)
+//       * Total time: ~100ms
+//       * Can safely use FAST_POLL_MS (200ms)
+//       * Result: Responsive during pickup/movement
+//
+//   - SETTLING/IDLE states (on table):
+//       * Magnitude check PASSES
+//       * Deviation check EXECUTES (~500ms)
+//       * Total time: ~600ms
+//       * REQUIRES SLOW_POLL_MS (700ms) to avoid dropped heartbeats
+//       * Result: Complete stability check per heartbeat period
+//
+// Why SETTLING States Are Essential:
+//   - Without SETTLING: Would need FAST_POLL (200ms) even when on table
+//   - Problem: Stability check (~600ms) > poll period (200ms)
+//   - Result: Multiple heartbeats collapse, irregular sampling, timing bugs
+//   - Solution: SETTLING states use SLOW_POLL (700ms) when on table
+//   - Benefit: Clean timing + battery efficiency + correct behavior
+//
+// Optimization: Direct MOVING→IDLE Transition
+//   - If water is already stable when put down, skip SETTLING state
+//   - Handled by stability task doing deviation check even in MOVING state
+//   - Saves one state transition in common case
+// ============================================================================
 
 // Duty Cycle Intervals
-const int FAST_POLL_MS = 200;   // Check fast when interacting
-const int SLOW_POLL_MS = 2000; // Check slow when idle (Deep Sleep Duty Cycle)
+const int FAST_POLL_MS = 200;   // Safe for MOVING states (magnitude check only ~100ms)
+const int SLOW_POLL_MS = 700;   // Required for SETTLING/IDLE states (full stability check ~600ms)
 
 enum class EventType {
   HEARTBEAT_TICK,
-  CHECK_FOR_DRINK,
   BLE_COMMAND_RECEIVED
 };
 
@@ -92,10 +132,12 @@ struct Event {
 };
 
 enum class DeviceState {
-  IDLE_WITH_GLASS,
-  IDLE_NO_GLASS,
-  MOVING_WITH_GLASS,
-  MOVING_NO_GLASS,
+  IDLE_WITH_GLASS,      // Stable on table with glass (slow poll, full stability check)
+  IDLE_NO_GLASS,        // Stable on table without glass (slow poll, full stability check)
+  MOVING_WITH_GLASS,    // In air with glass (fast poll, magnitude check only)
+  MOVING_NO_GLASS,      // In air without glass (fast poll, magnitude check only)
+  SETTLING_WITH_GLASS,  // On table but water sloshing (slow poll, full stability check)
+  SETTLING_NO_GLASS,    // On table but unstable (slow poll, full stability check)
   TEST
 };
 
@@ -158,7 +200,8 @@ float getWeight() {
 }
 
 // Quick magnitude check - single reading to see if coaster is on table.
-// Fast enough for high-frequency polling during MOVING states.
+// Timing: ~100ms typical (1 loadcell reading), 200ms worst case
+// Safe for FAST_POLL_MS (200ms) when used alone (as in MOVING states)
 static bool performQuickMagnitudeCheck(float &outWeight) {
   float weight = getWeight();
   if (isnan(weight)) { outWeight = NAN; return false; }
@@ -174,24 +217,11 @@ static bool performQuickMagnitudeCheck(float &outWeight) {
   return magOk;
 }
 
-// Full stability check with deviation sampling. Takes multiple readings to
-// detect water sloshing. Only call when magnitude already passes (on table).
-// Should be executed from the dedicated FreeRTOS task (not from ISRs).
-static bool performDeviationCheck(float &outWeight) {
-  // First do magnitude check
-  float weight = getWeight();
-  if (isnan(weight)) { outWeight = NAN; return false; }
-  outWeight = weight;
-
-  bool magOk = (weight >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
-  if (!magOk) {
-    Serial.print("Stability: weight=");
-    Serial.print(weight, 1);
-    Serial.println("g magOk=NO");
-    return false;
-  }
-
-  // Magnitude OK - sample for deviation
+// Deviation check only - samples multiple readings to detect water sloshing.
+// Timing: ~500ms typical (5 loadcell readings), 1000ms worst case
+// EXPENSIVE: Requires SLOW_POLL_MS (700ms) to avoid dropped heartbeats
+// Call after magnitude check passes. Does NOT redo magnitude check.
+static bool performDeviationCheck() {
   long rawLast = getRawReading();
   if (rawLast == LONG_MIN) { return false; }
   long rawSumDelta = 0;
@@ -206,13 +236,9 @@ static bool performDeviationCheck(float &outWeight) {
   long avgRawDelta = rawSumDelta / (STABILITY_SAMPLES - 1);
   bool deviationOk = (avgRawDelta <= LOADCELL_RAW_DEVIATION_THRESHOLD);
 
-  Serial.print("Stability: delta=");
+  Serial.print("DevCheck: delta=");
   Serial.print(avgRawDelta);
-  Serial.print(" weight=");
-  Serial.print(weight, 1);
-  Serial.print("g devOk=");
-  Serial.print(deviationOk ? "YES" : "NO");
-  Serial.print(" stable=");
+  Serial.print(" devOk=");
   Serial.println(deviationOk ? "YES" : "NO");
 
   return deviationOk;
@@ -220,9 +246,22 @@ static bool performDeviationCheck(float &outWeight) {
 
 // FreeRTOS task: waits for notification from heartbeat timer, performs the
 // loadcell stability sampling, updates cached state, then enqueues HEARTBEAT_TICK.
-// Check type depends on timer period:
-// - Fast period: quick magnitude check only (coaster in air detection)
-// - Slow period: full deviation check (water settling detection)
+//
+// Timing Behavior (critical for state machine design):
+//   - Always does magnitude check first (~100ms)
+//   - If magnitude FAILS (in air): Deviation check SKIPPED, returns quickly (~100ms)
+//   - If magnitude PASSES (on table): Deviation check EXECUTED (~500ms)
+//
+// This conditional execution is why MOVING states can use FAST_POLL_MS:
+//   - When in air: Only magnitude check runs (~100ms < 200ms FAST_POLL)
+//   - When on table: Full check runs (~600ms > 200ms FAST_POLL)
+//   - SETTLING/IDLE states switch to SLOW_POLL_MS (700ms) to handle full check
+//
+// Direct MOVING→IDLE optimization:
+//   - Deviation check runs even in MOVING state when magnitude passes
+//   - Allows skipping SETTLING state when water is already stable
+//   - If stable=true in MOVING state: transition directly to IDLE
+//   - If stable=false in MOVING state: transition to SETTLING
 void loadcellStabilityTask(void *pvParameters) {
   (void)pvParameters;
 
@@ -234,16 +273,28 @@ void loadcellStabilityTask(void *pvParameters) {
     bool magOk = false;
     bool stable = false;
 
-    if (fastPeriodActive) {
-      // Fast period: quick magnitude check only
-      magOk = performQuickMagnitudeCheck(measuredWeight);
-      // Can't be stable without full deviation check
-      stable = false;
-    } else {
-      // Slow period: full stability check with deviation sampling
-      stable = performDeviationCheck(measuredWeight);
-      magOk = (measuredWeight >= LOADCELL_BOTTOM_PLATE_THRESHOLD);
+    // Always do magnitude check first
+    magOk = performQuickMagnitudeCheck(measuredWeight);
+
+    if (magOk) {
+      // Coaster on table - do deviation check to determine if fully stable
+      // This allows direct MOVING→IDLE transition if water isn't sloshing
+      stable = performDeviationCheck();
+
+      if (!stable) {
+        // Deviation failed - re-check magnitude with fresh reading
+        // This catches the case where coaster was picked up during deviation sampling
+        float freshWeight = NAN;
+        bool freshMagOk = performQuickMagnitudeCheck(freshWeight);
+        if (!freshMagOk) {
+          // Coaster was picked up during deviation check
+          magOk = false;
+          measuredWeight = freshWeight;
+          Serial.println("Magnitude re-check: picked up during deviation");
+        }
+      }
     }
+    // If magnitude failed (in air), stable stays false
 
     // Update shared state
     loadcellLastWeight = measuredWeight;
@@ -736,19 +787,16 @@ void loop() {
   if (xQueueReceive(eventQueue, &evt, portMAX_DELAY) == pdTRUE) {
     bool eventConsumed = false;
     bool glassPresent = false;
-    Serial.print("Event received: ");
+    Serial.print("Event: ");
     switch (evt.type) {
       case EventType::BLE_COMMAND_RECEIVED:
-        Serial.println("BLE_COMMAND_RECEIVED");
+        Serial.print("BLE_COMMAND_RECEIVED ->");
         break;
       case EventType::HEARTBEAT_TICK:
-        Serial.println("HEARTBEAT_TICK");
-        break;
-      case EventType::CHECK_FOR_DRINK:
-        Serial.println("CHECK_FOR_DRINK");
+        Serial.print("HEARTBEAT_TICK ->");
         break;
       default:
-        Serial.println("UNKNOWN");
+        Serial.print("UNKNOWN ->");
         break;
     }
     if (evt.type == EventType::BLE_COMMAND_RECEIVED) {
@@ -774,56 +822,63 @@ void loop() {
         // Monitor for drinking activity
         Serial.println("State: IDLE_WITH_GLASS");
 
-        if (evt.type == EventType::CHECK_FOR_DRINK) {
-          float weight = getWeight();
-          if (!isnan(weight)) {
-            // Initialize prevWeight on first valid reading or after glass change
-            if (isnan(prevWeight) || glassChanged) {
-              prevWeight = weight;
-              glassChanged = false;
-              Serial.print("Baseline weight set to ");
-              Serial.print(prevWeight);
-              Serial.println(" g");
-            } else {
-              float drinkAmount = prevWeight - weight;
-              if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
-                totalConsumed += drinkAmount;
-                Serial.print("Drink detected: ");
-                Serial.print(drinkAmount);
-                Serial.println(" g");
-
-                prevWeight = weight;
-
-                // Send consumption event via BLE (scaled by 100 for decimal precision)
-                int32_t scaledAmount = (int32_t)(drinkAmount * 100.0f + 0.5f);
-                sendConsumptionEvent(millis(), scaledAmount);
-              }
-            }
-          }
-        }
-
-        // On heartbeat: check for instability (movement) or glass removal
-        else if (evt.type == EventType::HEARTBEAT_TICK) {
-          // Detect movement via loadcell instability
-          if (!loadcellStable) {
+        if (evt.type == EventType::HEARTBEAT_TICK) {
+          if (!loadcellMagnitudeOk) {
+            // Coaster picked up (in air) - go to MOVING
             currentState = DeviceState::MOVING_WITH_GLASS;
-            Serial.println("Transition to MOVING_WITH_GLASS");
-            // Switch to faster heartbeat tick for active state
+            Serial.println("Transition to MOVING_WITH_GLASS (picked up)");
+            // Switch to FAST_POLL_MS: In air, only magnitude check runs (~100ms)
+            // This is safe because deviation check is skipped when magnitude fails
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
-            fastPeriodActive = true;
+            wasPickedUp = true;
 
             // Give feedback on progress towards hydration goal when glass is picked up
             xTaskNotifyGive(ledFeedbackTaskHandle);
+          } else if (!loadcellStable) {
+            // On table but disturbed (water sloshing) - go to SETTLING, no feedback
+            currentState = DeviceState::SETTLING_WITH_GLASS;
+            Serial.println("Transition to SETTLING_WITH_GLASS (disturbed)");
+            // Stay on SLOW_POLL_MS: Full stability check (~600ms) requires 700ms period
           } else if (!glassPresent) {
             currentState = DeviceState::IDLE_NO_GLASS;
             Serial.println("Transition to IDLE_NO_GLASS");
-
             glassChanged = true;
           } else {
-            // Use cached weight from stability task
+            // Fully stable with glass - check for drink or update weight
             float weight = loadcellLastWeight;
             if (!isnan(weight)) {
-              prevWeight = weight;
+              if (wasPickedUp) {
+                // First stable heartbeat after being picked up - check for drink
+                if (isnan(prevWeight) || glassChanged) {
+                  prevWeight = weight;
+                  glassChanged = false;
+                  Serial.print("Baseline weight set to ");
+                  Serial.print(prevWeight);
+                  Serial.println(" g");
+                } else {
+                  float drinkAmount = prevWeight - weight;
+                  if (drinkAmount > THRESHOLD_DRINK_AMOUNT) {
+                    totalConsumed += drinkAmount;
+                    Serial.print("Drink detected: ");
+                    Serial.print(drinkAmount);
+                    Serial.println(" g");
+                    prevWeight = weight;
+                    int32_t scaledAmount = (int32_t)(drinkAmount * 100.0f + 0.5f);
+                    sendConsumptionEvent(millis(), scaledAmount);
+                  } else {
+                    // No significant drink, still update baseline
+                    prevWeight = weight;
+                  }
+                }
+                // Clear flag after processing pickup event (baseline set or drink detected)
+                wasPickedUp = false;
+              } else {
+                // Normal idle - just update weight for tracking
+                Serial.print("Idle weight update: ");
+                Serial.print(weight);
+                Serial.println(" g");
+                prevWeight = weight;
+              }
             }
           }
         }
@@ -834,122 +889,154 @@ void loop() {
         // Monitor for glass placement
         Serial.println("State: IDLE_NO_GLASS");
 
-        // On heartbeat: check for instability (movement) or glass placement
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          if (!loadcellStable) {
+          if (!loadcellMagnitudeOk) {
+            // Coaster picked up - go to MOVING
             currentState = DeviceState::MOVING_NO_GLASS;
-            Serial.println("Transition to MOVING_NO_GLASS");
-            // Switch to faster heartbeat tick for active state
+            Serial.println("Transition to MOVING_NO_GLASS (picked up)");
             xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
-            fastPeriodActive = true;
+            wasPickedUp = true;
+          } else if (!loadcellStable) {
+            // On table but disturbed - go to SETTLING
+            currentState = DeviceState::SETTLING_NO_GLASS;
+            Serial.println("Transition to SETTLING_NO_GLASS (disturbed)");
           } else if (glassPresent) {
             currentState = DeviceState::IDLE_WITH_GLASS;
             Serial.println("Transition to IDLE_WITH_GLASS");
-
             glassChanged = true;
           }
         }
         break;
       
       case DeviceState::MOVING_WITH_GLASS:
-        // Handle movement with glass
-        // Two-phase approach:
-        // - Fast period: quick magnitude check (is coaster on table?)
-        // - Slow period: full deviation check (is water settled?)
+        // Coaster is in the air with glass
+        // Stability task does both mag and deviation checks when mag passes
         Serial.println("State: MOVING_WITH_GLASS");
 
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          if (fastPeriodActive) {
-            // Fast period: only magnitude check was performed
-            if (loadcellMagnitudeOk) {
-              // Coaster landed on table - switch to slow period for deviation check
-              Serial.println("Magnitude OK - switching to slow period for deviation check");
-              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-              fastPeriodActive = false;
-              // Stay in MOVING_WITH_GLASS until deviation check passes
-            } else if (!glassPresent) {
-              currentState = DeviceState::MOVING_NO_GLASS;
-              Serial.println("Transition to MOVING_NO_GLASS");
-              glassChanged = true;
-            }
-            // else: still in air, stay in fast period
-          } else {
-            // Slow period: full stability check was performed
-            if (loadcellStable && glassPresent) {
-              currentState = DeviceState::IDLE_WITH_GLASS;
-              Serial.println("Transition to IDLE_WITH_GLASS");
-              // Already on slow period
+          if (loadcellStable) {
+            // Fully stable - go directly to IDLE
+            currentState = glassPresent ? DeviceState::IDLE_WITH_GLASS : DeviceState::IDLE_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to IDLE_WITH_GLASS" : "Transition to IDLE_NO_GLASS");
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
 
-              // Queue CHECK_FOR_DRINK event
-              Event e;
-              e.type = EventType::CHECK_FOR_DRINK;
-              e.timestamp = millis();
-              e.value = 0;
-              xQueueSend(eventQueue, &e, 0);
-            } else if (loadcellStable && !glassPresent) {
-              currentState = DeviceState::IDLE_NO_GLASS;
-              Serial.println("Transition to IDLE_NO_GLASS");
-              // Already on slow period
+            if (!glassPresent) {
               glassChanged = true;
-            } else if (!loadcellMagnitudeOk) {
-              // Coaster picked up again - back to fast period
-              Serial.println("Magnitude failed - switching back to fast period");
-              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
-              fastPeriodActive = true;
-              if (!glassPresent) {
-                currentState = DeviceState::MOVING_NO_GLASS;
-                Serial.println("Transition to MOVING_NO_GLASS");
-                glassChanged = true;
-              }
+              wasPickedUp = false;  // Clear flag - no glass to drink from
             }
-            // else: deviation check failed but magnitude OK (water sloshing) - stay in slow period, retry
+            // Keep wasPickedUp=true for IDLE_WITH_GLASS - drink check will happen on next heartbeat
+          } else if (loadcellMagnitudeOk) {
+            // On table but water sloshing - go to SETTLING
+            currentState = glassPresent ? DeviceState::SETTLING_WITH_GLASS : DeviceState::SETTLING_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to SETTLING_WITH_GLASS" : "Transition to SETTLING_NO_GLASS");
+            // CRITICAL: Switch to SLOW_POLL_MS because coaster is now on table
+            // Full stability check (~600ms) requires 700ms period to avoid dropped heartbeats
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+
+            if (!glassPresent) glassChanged = true;
+          } else if (!glassPresent) {
+            // Still in air but glass removed
+            currentState = DeviceState::MOVING_NO_GLASS;
+            Serial.println("Transition to MOVING_NO_GLASS");
+            glassChanged = true;
           }
+          // else: still in air with glass, stay in MOVING
         }
         break;
       
       case DeviceState::MOVING_NO_GLASS:
-        // Handle movement without glass
-        // Two-phase approach (same as MOVING_WITH_GLASS)
+        // Coaster is in the air without glass
         Serial.println("State: MOVING_NO_GLASS");
 
         if (evt.type == EventType::HEARTBEAT_TICK) {
-          if (fastPeriodActive) {
-            // Fast period: only magnitude check was performed
-            if (loadcellMagnitudeOk) {
-              // Coaster landed on table - switch to slow period for deviation check
-              Serial.println("Magnitude OK - switching to slow period for deviation check");
-              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
-              fastPeriodActive = false;
-            } else if (glassPresent) {
-              currentState = DeviceState::MOVING_WITH_GLASS;
-              Serial.println("Transition to MOVING_WITH_GLASS");
-              glassChanged = true;
-            }
-            // else: still in air, stay in fast period
-          } else {
-            // Slow period: full stability check was performed
-            if (loadcellStable && glassPresent) {
-              currentState = DeviceState::IDLE_WITH_GLASS;
-              Serial.println("Transition to IDLE_WITH_GLASS");
-              // Already on slow period
-              glassChanged = true;
-            } else if (loadcellStable && !glassPresent) {
-              currentState = DeviceState::IDLE_NO_GLASS;
-              Serial.println("Transition to IDLE_NO_GLASS");
-              // Already on slow period
-            } else if (!loadcellMagnitudeOk) {
-              // Coaster picked up again - back to fast period
-              Serial.println("Magnitude failed - switching back to fast period");
-              xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
-              fastPeriodActive = true;
-              if (glassPresent) {
-                currentState = DeviceState::MOVING_WITH_GLASS;
-                Serial.println("Transition to MOVING_WITH_GLASS");
-                glassChanged = true;
-              }
-            }
-            // else: deviation check failed but magnitude OK - stay in slow period, retry
+          if (loadcellStable) {
+            // Fully stable - go directly to IDLE
+            currentState = glassPresent ? DeviceState::IDLE_WITH_GLASS : DeviceState::IDLE_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to IDLE_WITH_GLASS" : "Transition to IDLE_NO_GLASS");
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+
+            if (glassPresent) glassChanged = true;
+            wasPickedUp = false;
+          } else if (loadcellMagnitudeOk) {
+            // On table but unstable - go to SETTLING
+            currentState = glassPresent ? DeviceState::SETTLING_WITH_GLASS : DeviceState::SETTLING_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to SETTLING_WITH_GLASS" : "Transition to SETTLING_NO_GLASS");
+            // CRITICAL: Switch to SLOW_POLL_MS because coaster is now on table
+            // Full stability check (~600ms) requires 700ms period to avoid dropped heartbeats
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(SLOW_POLL_MS), 0);
+
+            if (glassPresent) glassChanged = true;
+          } else if (glassPresent) {
+            // Still in air but glass added
+            currentState = DeviceState::MOVING_WITH_GLASS;
+            Serial.println("Transition to MOVING_WITH_GLASS");
+            glassChanged = true;
           }
+          // else: still in air without glass, stay in MOVING
+        }
+        break;
+
+      case DeviceState::SETTLING_WITH_GLASS:
+        // Coaster on table but water sloshing, waiting for stability
+        Serial.println("State: SETTLING_WITH_GLASS");
+
+        if (evt.type == EventType::HEARTBEAT_TICK) {
+          if (loadcellStable) {
+            // Now stable - go to IDLE
+            currentState = glassPresent ? DeviceState::IDLE_WITH_GLASS : DeviceState::IDLE_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to IDLE_WITH_GLASS" : "Transition to IDLE_NO_GLASS");
+
+            if (!glassPresent) glassChanged = true;
+            // Keep wasPickedUp - drink check will happen on next heartbeat with fresh weight
+          } else if (!loadcellMagnitudeOk) {
+            // Picked up again - back to MOVING
+            currentState = glassPresent ? DeviceState::MOVING_WITH_GLASS : DeviceState::MOVING_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to MOVING_WITH_GLASS (picked up)" : "Transition to MOVING_NO_GLASS (picked up)");
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+            wasPickedUp = true;  // Now actually picked up
+
+            if (glassPresent) {
+              // Trigger feedback animation since now actually picked up
+              xTaskNotifyGive(ledFeedbackTaskHandle);
+            }
+            if (!glassPresent) glassChanged = true;
+          } else if (!glassPresent) {
+            // Glass removed while settling
+            currentState = DeviceState::SETTLING_NO_GLASS;
+            Serial.println("Transition to SETTLING_NO_GLASS");
+            glassChanged = true;
+          }
+          // else: still settling, stay in SETTLING_WITH_GLASS
+        }
+        break;
+
+      case DeviceState::SETTLING_NO_GLASS:
+        // Coaster on table but unstable, no glass
+        Serial.println("State: SETTLING_NO_GLASS");
+
+        if (evt.type == EventType::HEARTBEAT_TICK) {
+          if (loadcellStable) {
+            // Now stable - go to IDLE
+            currentState = glassPresent ? DeviceState::IDLE_WITH_GLASS : DeviceState::IDLE_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to IDLE_WITH_GLASS" : "Transition to IDLE_NO_GLASS");
+
+            if (glassPresent) glassChanged = true;
+            wasPickedUp = false;
+          } else if (!loadcellMagnitudeOk) {
+            // Picked up again - back to MOVING
+            currentState = glassPresent ? DeviceState::MOVING_WITH_GLASS : DeviceState::MOVING_NO_GLASS;
+            Serial.println(glassPresent ? "Transition to MOVING_WITH_GLASS (picked up)" : "Transition to MOVING_NO_GLASS (picked up)");
+            xTimerChangePeriod(heartbeatTimer, pdMS_TO_TICKS(FAST_POLL_MS), 0);
+            wasPickedUp = true;
+
+            if (glassPresent) glassChanged = true;
+          } else if (glassPresent) {
+            // Glass added while settling
+            currentState = DeviceState::SETTLING_WITH_GLASS;
+            Serial.println("Transition to SETTLING_WITH_GLASS");
+            glassChanged = true;
+          }
+          // else: still settling, stay in SETTLING_NO_GLASS
         }
         break;
       
