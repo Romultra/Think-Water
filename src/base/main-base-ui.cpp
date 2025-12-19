@@ -4,7 +4,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
-#include <SD.h>
+#include <Preferences.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEClient.h>
@@ -12,6 +12,7 @@
 #include "Adafruit_SHT4x.h"
 #include "RTClib.h"
 #include "oled-ssd1333.h"
+#include "boot_logo.h"
 
 // Nice TrueType fonts for better rendering at large sizes
 #include <Fonts/FreeSansBold18pt7b.h>
@@ -30,17 +31,13 @@ extern float predictWaterTurnoverCH(
 );
 
 // ============================================================================
-// Pin Definitions (Updated to avoid conflicts)
+// Pin Definitions
 // ============================================================================
 #define PIN_SDA           21      // I2C SDA for SHT41 and RTC
 #define PIN_SCL           22      // I2C SCL for SHT41 and RTC
-#define PIN_SD_MOSI       23      // SPI MOSI (shared with OLED)
-#define PIN_SD_MISO       19      // SPI MISO
-#define PIN_SD_SCK        18      // SPI SCK (shared with OLED)
-#define PIN_SD_CS         5       // SPI CS for SD card
 #define PIN_BUZZER        4       // Active buzzer
 
-// OLED Display (SSD1333) - uses default SPI, only specify CS/DC/RST
+// OLED Display (SSD1333) - uses default SPI (MOSI=23, SCK=18), only specify CS/DC/RST
 #define PIN_OLED_CS       15      // OLED Chip Select
 #define PIN_OLED_DC       2       // OLED Data/Command
 #define PIN_OLED_RST      16      // OLED Reset
@@ -53,7 +50,7 @@ extern float predictWaterTurnoverCH(
 // ============================================================================
 // Debug Configuration
 // ============================================================================
-#define DEBUG_ENCODER               true    // Set to true to debug encoder issues
+#define DEBUG_ENCODER               false    // Set to true to debug encoder issues
 
 // ============================================================================
 // Timing Constants
@@ -145,6 +142,8 @@ struct HydrationState {
     float totalConsumedML;
     uint8_t remindersSent;
     bool goalSentToCoaster;
+    float goalTemperature;   // Temperature used for current goal calculation
+    float goalHumidity;      // Humidity used for current goal calculation
 };
 
 struct SensorBuffer {
@@ -191,9 +190,9 @@ struct EncoderState {
 SSD1333 display(PIN_OLED_CS, PIN_OLED_DC, PIN_OLED_RST);
 RTC_DS1307 rtc;
 Adafruit_SHT4x sht41;
+Preferences preferences;  // NVS flash storage for persistent data
 bool rtcInitialized = false;
 bool sensorInitialized = false;
-bool sdInitialized = false;
 bool displayInitialized = false;
 
 // UI State
@@ -255,7 +254,7 @@ float pendingGoal = 0.0f;
 uint32_t connectStartTime = 0;
 
 // Hydration tracking
-HydrationState hydrationState = {0, 0.0f, 0.0f, 0, false};
+HydrationState hydrationState = {0, 0.0f, 0.0f, 0, false, 20.0f, 50.0f};
 uint32_t lastAlertTime = 0;
 bool consumptionReceived = false;
 ConsumptionEvent latestConsumption = {0, 0, 0.0f};
@@ -268,17 +267,14 @@ void initSPI();
 void initDisplay();
 void initRTC();
 void initSensor();
-void initSD();
 void initBLE();
 void initBuzzer();
 void initEncoder();
+void initStorage();
 void updateEncoder();
 bool readSensor(SensorReading* reading);
 void addSensorReading(const SensorReading& reading);
-float getAverageTemperature();
-float getAverageHumidity();
-void logSensorReading(const SensorReading& reading);
-void logConsumptionEvent(const ConsumptionEvent& event);
+void saveConsumption(float amountML);
 float loadTodayConsumption();
 void saveUserConfig();
 void loadUserConfig();
@@ -398,9 +394,10 @@ class MyScanCallbacks : public BLEAdvertisedDeviceCallbacks {
 // ============================================================================
 
 void initSPI() {
-    // Initialize shared SPI bus for both SD card and OLED
-    SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI);
-    Serial.println("SPI bus initialized (shared for SD and OLED)");
+    // Initialize SPI bus with default pins for OLED display
+    // Default ESP32 SPI pins: MOSI=23, MISO=19, SCK=18, SS=5
+    SPI.begin();
+    Serial.println("SPI bus initialized for OLED");
 }
 
 void initDisplay() {
@@ -408,30 +405,23 @@ void initDisplay() {
     if (display.begin()) {
         displayInitialized = true;
 
-        // Show splash screen
-        display.fillScreen(COLOR_BLACK);
-        display.setTextColor(RGB565(100, 200, 255));
-        display.setFont(&FreeSansBold18pt7b);
+        // Show boot logo from flash (PROGMEM)
+        display.fillScreen(COLOR_BLACK);  // Black background
 
-        // Center "Think" on first line
-        int16_t x1, y1;
-        uint16_t w, h;
-        display.getTextBounds("Think", 0, 0, &x1, &y1, &w, &h);
-        display.setCursor((176 - w) / 2, 75);
-        display.print("Think");
+        // Draw non-black pixels from compressed logo data
+        Serial.println("Drawing boot logo...");
+        for (uint16_t i = 0; i < BOOT_LOGO_PIXEL_COUNT; i++) {
+            BootLogoPixel pixel;
+            memcpy_P(&pixel, &BOOT_LOGO_DATA[i], sizeof(BootLogoPixel));
+            display.drawPixel(pixel.x, pixel.y, pixel.color);
+        }
 
-        // Center "Water" on second line
-        display.getTextBounds("Water", 0, 0, &x1, &y1, &w, &h);
-        display.setCursor((176 - w) / 2, 110);
-        display.print("Water");
-
-        display.setFont(); // Return to default font
-        delay(1500);
+        delay(1500);  // Show logo for 1.5 seconds
 
         // Clear screen for later use
         display.fillScreen(COLOR_BLACK);
 
-        Serial.println("OLED initialized");
+        Serial.println("OLED initialized with boot logo");
     } else {
         Serial.println("ERROR: OLED initialization failed!");
         displayInitialized = false;
@@ -467,42 +457,16 @@ void initSensor() {
     }
 }
 
-void initSD() {
-    // SPI bus is already initialized in initSPI()
-    // SD cards need significant time to stabilize after power-on
-    // Some cards need up to 1 second for internal voltage regulators
-    Serial.println("Waiting for SD card to stabilize after power-on...");
-    delay(500);  // Initial delay for card stabilization
+void initStorage() {
+    // Initialize NVS (Non-Volatile Storage) flash storage using Preferences library
+    // This replaces SD card functionality with built-in ESP32 flash storage
+    Serial.println("Initializing NVS flash storage...");
 
-    // Try multiple times with increasing delays (some cards are slow)
-    const int maxRetries = 3;
-    for (int attempt = 1; attempt <= maxRetries; attempt++) {
-        Serial.printf("SD card init attempt %d/%d...\n", attempt, maxRetries);
+    // Preferences uses namespaces to organize data
+    // We use "coaster" namespace for all our data
+    // Note: Preferences will be opened/closed as needed in save/load functions
 
-        if (SD.begin(PIN_SD_CS)) {
-            sdInitialized = true;
-            Serial.println("SD card initialized successfully");
-
-            // Create required directories
-            if (!SD.exists("/hydration")) {
-                SD.mkdir("/hydration");
-            }
-            if (!SD.exists("/config")) {
-                SD.mkdir("/config");
-            }
-            return;  // Success!
-        }
-
-        // Failed - wait before retry (except on last attempt)
-        if (attempt < maxRetries) {
-            Serial.printf("SD init failed, retrying in %dms...\n", attempt * 200);
-            delay(attempt * 200);  // Exponential backoff: 200ms, 400ms
-        }
-    }
-
-    // All attempts failed
-    Serial.println("ERROR: SD card initialization failed after all retries!");
-    sdInitialized = false;
+    Serial.println("NVS flash storage ready");
 }
 
 void initBLE() {
@@ -539,11 +503,11 @@ void initEncoder() {
 
 void initHardware() {
     initBuzzer();
-    initSPI();       // Initialize shared SPI bus first
+    initSPI();       // Initialize SPI bus for OLED
     initDisplay();   // OLED needs SPI
     initSensor();    // I2C sensor
     initRTC();       // I2C RTC
-    initSD();        // SD card needs SPI
+    initStorage();   // NVS flash storage (replaces SD card)
     initBLE();
     initEncoder();
 }
@@ -682,26 +646,34 @@ void updateEncoder() {
 // ============================================================================
 
 void saveUserConfig() {
-    if (!sdInitialized) return;
+    // Save user configuration to NVS flash using Preferences
+    preferences.begin("coaster", false);  // false = read/write mode
 
-    File file = SD.open("/config/user.cfg", FILE_WRITE);
-    if (file) {
-        file.write((uint8_t*)&userConfig, sizeof(UserConfig));
-        file.close();
-        Serial.println("User configuration saved");
-    } else {
-        Serial.println("ERROR: Failed to save user configuration");
-    }
+    preferences.putUChar("age", userConfig.age);
+    preferences.putUChar("sex", userConfig.sex);
+    preferences.putUChar("weight", userConfig.weight);
+    preferences.putBool("setupDone", userConfig.setupComplete);
+    preferences.putBool("timeSet", userConfig.timeSet);
+
+    preferences.end();
+    Serial.println("User configuration saved to NVS flash");
 }
 
 void loadUserConfig() {
-    if (!sdInitialized) return;
+    // Load user configuration from NVS flash using Preferences
+    preferences.begin("coaster", true);  // true = read-only mode
 
-    File file = SD.open("/config/user.cfg", FILE_READ);
-    if (file && file.size() == sizeof(UserConfig)) {
-        file.read((uint8_t*)&userConfig, sizeof(UserConfig));
-        file.close();
-        Serial.println("User configuration loaded");
+    // Check if data exists by checking setupDone flag
+    if (preferences.isKey("setupDone")) {
+        userConfig.age = preferences.getUChar("age", 35);
+        userConfig.sex = preferences.getUChar("sex", 0);
+        userConfig.weight = preferences.getUChar("weight", 70);
+        userConfig.setupComplete = preferences.getBool("setupDone", false);
+        userConfig.timeSet = preferences.getBool("timeSet", false);
+
+        preferences.end();
+
+        Serial.println("User configuration loaded from NVS flash");
         Serial.printf("  Age: %d, Sex: %s, Weight: %d kg\n",
                       userConfig.age,
                       userConfig.sex ? "Male" : "Female",
@@ -710,8 +682,8 @@ void loadUserConfig() {
                       userConfig.setupComplete ? "Yes" : "No",
                       userConfig.timeSet ? "Yes" : "No");
     } else {
-        Serial.println("No saved configuration found, using defaults");
-        if (file) file.close();
+        preferences.end();
+        Serial.println("No saved configuration found in NVS, using defaults");
     }
 }
 
@@ -745,69 +717,48 @@ void addSensorReading(const SensorReading& reading) {
     }
 }
 
-float getAverageTemperature() {
-    if (sensorBuffer.count == 0) return 20.0f;
-    float sum = 0.0f;
-    for (uint8_t i = 0; i < sensorBuffer.count; i++) {
-        sum += sensorBuffer.readings[i].temperature;
-    }
-    return sum / sensorBuffer.count;
-}
+// Sensor readings are kept in-memory only (circular buffer)
+// No logging to flash to reduce wear on NVS
 
-float getAverageHumidity() {
-    if (sensorBuffer.count == 0) return 50.0f;
-    float sum = 0.0f;
-    for (uint8_t i = 0; i < sensorBuffer.count; i++) {
-        sum += sensorBuffer.readings[i].humidity;
-    }
-    return sum / sensorBuffer.count;
-}
+void saveConsumption(float amountML) {
+    // Save consumption total to NVS flash
+    // Called whenever new consumption is recorded
+    preferences.begin("coaster", false);  // false = read/write mode
 
-void logSensorReading(const SensorReading& reading) {
-    if (!sdInitialized) return;
-    File file = SD.open("/hydration/SENSOR.CSV", FILE_APPEND);
-    if (file) {
-        file.print(reading.timestamp);
-        file.print(",");
-        file.print(reading.temperature, 2);
-        file.print(",");
-        file.println(reading.humidity, 2);
-        file.close();
-    }
-}
+    float currentTotal = preferences.getFloat("consumedToday", 0.0f);
+    currentTotal += amountML;
+    preferences.putFloat("consumedToday", currentTotal);
 
-void logConsumptionEvent(const ConsumptionEvent& event) {
-    if (!sdInitialized) return;
-    File file = SD.open("/hydration/CONSUME.CSV", FILE_APPEND);
-    if (file) {
-        file.print(event.localTimestamp);
-        file.print(",");
-        file.println(event.amountML, 2);
-        file.close();
+    // Store the day to detect day changes
+    if (rtcInitialized) {
+        DateTime now = rtc.now();
+        preferences.putUChar("lastDay", now.day());
     }
+
+    preferences.end();
+    Serial.printf("Consumption saved: +%.1f mL, total: %.1f mL\n", amountML, currentTotal);
 }
 
 float loadTodayConsumption() {
-    if (!sdInitialized || !rtcInitialized) return 0.0f;
-    uint32_t now = getCurrentTimestamp();
-    uint32_t todayStart = now - (now % 86400);
+    // Load today's consumption total from NVS flash
+    if (!rtcInitialized) return 0.0f;
+
+    preferences.begin("coaster", true);  // true = read-only mode
+
+    DateTime now = rtc.now();
+    uint8_t storedDay = preferences.getUChar("lastDay", 0);
     float total = 0.0f;
 
-    File file = SD.open("/hydration/CONSUME.CSV", FILE_READ);
-    if (file) {
-        while (file.available()) {
-            String line = file.readStringUntil('\n');
-            int commaPos = line.indexOf(',');
-            if (commaPos > 0) {
-                uint32_t timestamp = line.substring(0, commaPos).toInt();
-                float amount = line.substring(commaPos + 1).toFloat();
-                if (timestamp >= todayStart) {
-                    total += amount;
-                }
-            }
-        }
-        file.close();
+    // Check if stored data is from today
+    if (storedDay == now.day()) {
+        total = preferences.getFloat("consumedToday", 0.0f);
+        Serial.printf("Loaded today's consumption: %.1f mL\n", total);
+    } else {
+        // Different day - start fresh
+        Serial.println("New day detected, starting consumption from zero");
     }
+
+    preferences.end();
     return total;
 }
 
@@ -1008,16 +959,25 @@ void processBLEState() {
 // ============================================================================
 
 float calculateDailyGoal() {
-    float avgTemp = getAverageTemperature();
-    float avgHumidity = getAverageHumidity();
+    // Read sensor ONCE when calculating goal and store the values
+    // Goal remains stable using these stored values (not live sensor data)
+    SensorReading reading;
+    if (readSensor(&reading)) {
+        hydrationState.goalTemperature = reading.temperature;
+        hydrationState.goalHumidity = reading.humidity;
+    }
+    // else: keep previous values (or defaults from initialization)
 
     float waterTurnover = predictWaterTurnoverCH(
         (float)userConfig.weight,
         userConfig.sex,
-        avgHumidity,
+        hydrationState.goalHumidity,
         (float)userConfig.age,
-        avgTemp
+        hydrationState.goalTemperature
     );
+
+    Serial.printf("Goal calculated using: %.1f°C, %.1f%% humidity\n",
+                  hydrationState.goalTemperature, hydrationState.goalHumidity);
 
     return waterTurnover * LIQUID_INTAKE_FACTOR;
 }
@@ -1041,6 +1001,16 @@ void onNewDay() {
     hydrationState.dailyGoalML = calculateDailyGoal();
     pendingGoal = hydrationState.dailyGoalML;
     goalPending = true;
+
+    // Reset consumption in NVS flash for new day
+    preferences.begin("coaster", false);
+    preferences.putFloat("consumedToday", 0.0f);
+    if (rtcInitialized) {
+        DateTime now = rtc.now();
+        preferences.putUChar("lastDay", now.day());
+    }
+    preferences.end();
+    Serial.println("NVS consumption reset for new day");
 }
 
 void soundBuzzer() {
@@ -1983,7 +1953,7 @@ void setup() {
     SensorReading reading;
     if (readSensor(&reading)) {
         addSensorReading(reading);
-        logSensorReading(reading);
+        // Sensor readings kept in-memory only (no flash logging)
     }
 
     lastActivity = millis();
@@ -2022,7 +1992,7 @@ void loop() {
             SensorReading reading;
             if (readSensor(&reading)) {
                 addSensorReading(reading);
-                logSensorReading(reading);
+                // Sensor readings kept in-memory only (no flash logging)
                 Serial.printf("Sensor: %.1fC, %.1f%%\n",
                              reading.temperature, reading.humidity);
             }
@@ -2035,7 +2005,7 @@ void loop() {
         if (consumptionReceived) {
             consumptionReceived = false;
             hydrationState.totalConsumedML += latestConsumption.amountML;
-            logConsumptionEvent(latestConsumption);
+            saveConsumption(latestConsumption.amountML);  // Save to NVS flash
             Serial.printf("Total consumed: %.1f / %.1f mL\n",
                          hydrationState.totalConsumedML,
                          hydrationState.dailyGoalML);
