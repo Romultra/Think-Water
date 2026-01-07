@@ -532,7 +532,7 @@ S3 & Ergonomic comfort is achieved by designing the coaster diameter (\#19) betw
 
 \subsubsection{Key elements in the design related to the unique selling points}
 
-The main USP of our product is the personalization of the daily hydration target. Unlike existing solutions that rely on generic recommendations, our system computes a specific consumption goal for each user using an internal model based on personal and environmental parameters. This makes hydration monitoring more relevant and meaningful. The model was taken from literature \textcolor{red}{mettre la ref du paper avec le model}, adapted and implemented in our algorithm.\vspace{0.2cm}
+The main USP of our product is the personalization of the daily hydration target. Unlike existing solutions that rely on generic recommendations, our system computes a specific consumption goal for each user using an internal model based on personal and environmental parameters. This makes hydration monitoring more relevant and meaningful. The model was taken from Yamada et al. (2022) \cite{WaterTurnover2022}, a large-scale study published in \textit{Science} involving 5,604 participants from 23 countries, adapted and implemented in our algorithm.\vspace{0.2cm}
 
 Another key design choice is the detachable measurement unit placed directly under the glass. While most existing devices are table-based or integrated into dedicated containers, our coaster allows the user to keep their own glassware. This reduces habit changes and makes the product particularly well suited for domestic and senior use.\vspace{0.2cm}
 
@@ -548,9 +548,22 @@ This section presents how the main technical functions of the "Think Water" were
 
 \textbf{Personalized hydration target computation (M7)}\vspace{0.2cm}
 
-To estimate the hydration target we use the following model: \textcolor{red}{mettre la formule du modele}\vspace{0.2cm}
+To estimate the hydration target, we use the water turnover prediction model developed by Yamada et al. (2022) \cite{WaterTurnover2022}. This model was derived from isotope-tracking measurements (deuterium) of 5,604 individuals aged 8 days to 96 years across 23 countries. The equation predicts daily water turnover (mL/day) based on multiple environmental and physiological factors:
 
-For further improvement, adding parameters would not significantly improve the precision of the hydration objective, since the ones already used have the greatest influence. Nevertheless, taking into account drinking habits such as time, quantity, or even the user’s location could help optimize the effectiveness of reminders.
+\begin{equation}
+\begin{split}
+WT = & \, 1076 \times PAL + 14.34 \times W_{kg} + 374.9 \times S + 5.823 \times H_{\%} \\
+     & + 1070 \times A_s + 104.6 \times HDI + 0.4726 \times Alt_m \\
+     & - 0.3529 \times Age^2 + 24.78 \times Age \\
+     & + 1.865 \times T^2 - 19.66 \times T - 713.1
+\end{split}
+\end{equation}
+
+where $WT$ is water turnover (mL/day), $PAL$ is physical activity level, $W_{kg}$ is body weight (kg), $S$ is sex (0=female, 1=male), $H_{\%}$ is relative humidity (\%), $A_s$ is athletic status (0=non-athlete, 1=athlete), $HDI$ is human development index (0=high, 1=middle, 2=low), $Alt_m$ is altitude (meters), $Age$ is age (years), and $T$ is ambient temperature (°C).
+
+For our Swiss domestic implementation, we simplified this model by fixing certain parameters: physical activity level at 1.5 (lightly active older adult), altitude at 500m (mean Swiss household altitude), HDI at 0 (high development country), and athletic status at 0 (non-athlete). This reduces the required user inputs to age, sex, and body weight, while the system automatically measures temperature and humidity. The model explains 47.1\% of water turnover variation in the original study.\vspace{0.2cm}
+
+For further improvement, adding parameters would not significantly improve the precision of the hydration objective, since the ones already used have the greatest influence. Nevertheless, taking into account drinking habits such as time, quantity, or even the user's location could help optimize the effectiveness of reminders.
 
 \textbf{Sip detection and water intake measurement (M1, M2, M4, M5)}\vspace{0.2cm}
 
@@ -712,7 +725,7 @@ This issue is expected to grow and become more problematic with the year. Accord
 Existing hydration-monitoring solutions are mainly designed for institutional environments such as hospitals or retirement homes, are often bulky and complex.
 There are no widely available, user-friendly products tailored for domestic use, particularly for seniors living independently. \vspace{0.2cm}
 
-Our goal is to offer a product that could fill the gap we found. It is primary for elderly people living at home. The idea is that on a daily basis, we set a goal of water consumption according to a regression model we found \textbf{LIEN DU MODEL REGRESSIF QU'ON UTILISE!!!}. If the goal is not reached, we will use visual and audio stimuli to remind the person to drink more. On long-term, our product will allow to visualize water consumption in a week or even month scale. This way people can track if their water consumption is getting better or not. This idea of visualization can help directly the person buying the product but could also be used by at-home nurses or family to check if the elderly person is drinking enough according to the recommendation.\vspace{0.2cm}
+Our goal is to offer a product that could fill the gap we found. It is primary for elderly people living at home. The idea is that on a daily basis, we set a goal of water consumption according to a scientifically validated regression model from Yamada et al. (2022) \cite{WaterTurnover2022}, which was developed using isotope-tracking data from over 5,600 individuals across 23 countries. If the goal is not reached, we will use visual and audio stimuli to remind the person to drink more. On long-term, our product will allow to visualize water consumption in a week or even month scale. This way people can track if their water consumption is getting better or not. This idea of visualization can help directly the person buying the product but could also be used by at-home nurses or family to check if the elderly person is drinking enough according to the recommendation.\vspace{0.2cm}
 
 It is important to note that our device is not medical grade. We however want to make something accurate such that it can be recommended by healthcare professionals. Because after some interviews we conducted with doctors, when someone gets hospitalized, it is often hard to determine if the reason is dehydration. By making an accurate enough product, doctors could use the data to determine faster if there is a risk of dehydration or not.\vspace{0.2cm}
 
