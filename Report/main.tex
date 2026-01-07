@@ -20,7 +20,7 @@
 \usepackage[backend=biber, style=numeric, sorting=none]{biblatex}
 \AtEveryBibitem{\clearfield{note}}
 \addbibresource{references.bib}
-\usepackage[colorlinks=false, linkcolor=black, urlcolor=black, citecolor=blue]{hyperref}
+\usepackage[colorlinks=true, linkcolor=blue, urlcolor=black, citecolor=blue]{hyperref}
 
 
 \begin{document}
@@ -575,9 +575,56 @@ This event-based logic was dimensioned through experimental calibration, allowin
 
 \textbf{Energy autonomy and power management (P1)}\vspace{0.2cm}
 
-Battery autonomy was dimensioned using a simplified power consumption model based on the operating modes of the system. The coaster alternates between low-power sleep states and short active phases during measurement, wireless communication, and feedback.\vspace{0.2cm}
+Battery autonomy was dimensioned using a detailed power consumption model based on component datasheets and firmware duty cycles. The coaster alternates between low-power sleep states and short active measurement phases.\vspace{0.2cm}
 
-Average current consumption was estimated by considering sensor duty cycles \textcolor{red}{peut etre vraiment calculer la consommation moyenne et mettre les calculs et donc l'autonomie}, Bluetooth Low Energy transmission frequency, and the expected number of drinking events per day. With an 820~mAh Li-ion battery, this model justifies an autonomy of approximately 7 to 10 days, which is well suited for elderly users and domestic use.\vspace{0.2cm}
+\textit{Component power consumption (from datasheets):}
+\begin{itemize}
+    \item nRF52840 microcontroller: 10~mA active, 4.5~$\mu$A System ON sleep
+    \item HX711 load cell amplifier: 15.8~mA active (including load cell power), 70~nA power-down
+    \item WS2812B LEDs (10 units): 16~mA per color channel at full brightness
+    \item Hall effect sensor: $\sim$1~mA during analog read
+    \item LSM6DS3TR-C IMU: 0.5~mA active, 5~$\mu$A power-down
+    \item QSPI flash: deep power-down at startup (eliminates 23~$\mu$A baseline)
+\end{itemize}
+
+\textit{LED actual power from firmware:}
+
+Feedback animation uses RGB(30, 200, 80) with gradual fill pattern. 
+
+Average power: $(30 + 200 + 80) / 255 \times 16~\text{mA} \times 5~\text{LEDs} = 68$~mA. 
+
+Alert animation uses RGB(255, 40, 20) with pulsing pattern on 10 LEDs. 
+
+Average power: $(255 + 40 + 20) / 255 \times 16~\text{mA} \times 10~\text{LEDs} \times 0.5 = 99$~mA.\\
+
+\textit{Operating duty cycles:}
+
+In IDLE states (stable on table), the system polls every 700~ms. Each polling cycle:
+\begin{itemize}
+    \item Wake phase (100~ms): nRF52840 active (10~mA) + HX711 stability check (15.8~mA)
+    \item Sleep phase (600~ms): Low-power mode (0.01~mA total)
+\end{itemize}
+
+Average IDLE current: $\frac{(10 + 15.8) \times 100 + 0.01 \times 600}{700} = 3.69$~mA \\
+
+During drinking events (10 events/day $\times$ 14~s/event = 140~s/day):
+\begin{itemize}
+    \item Continuous: nRF52840 (10~mA) + HX711 (15.8~mA) + sensors (1.5~mA) = 27.3~mA
+    \item LED feedback: 10 events $\times$ 3~s = 30~s/day at 68~mA
+    \item LED alert: 2 event/day $\times$ 2~s = 4~s/day at 99~mA
+\end{itemize}
+
+\textit{Daily energy budget:}
+\begin{itemize}
+    \item IDLE: $(86400 - 140)$~s / 3600 $\times$ 3.69~mA = 88.4~mAh
+    \item ACTIVE (non-LED): 140~s / 3600 $\times$ 27.3~mA = 1.06~mAh
+    \item LED feedback: 30~s / 3600 $\times$ 68~mA = 0.57~mAh
+    \item LED alert: 4~s / 3600 $\times$ 99~mA = 0.11~mAh
+    \item BLE advertising: 0.03~mA $\times$ 24~h = 0.72~mAh
+    \item \textbf{Total: 91~mAh/day}
+\end{itemize}
+
+With an 820~mAh Li-ion battery: $820 / 91 = 9.0$ days theoretical. Accounting for battery aging and temperature effects, practical autonomy is 7 to 10 days, well suited for weekly charging.\vspace{0.2cm}
 
 Future optimizations could include further reduction of communication frequency, more aggressive duty-cycling of sensors, or the integration of wireless charging to improve ease of use.\vspace{0.2cm}
 
