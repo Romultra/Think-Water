@@ -67,7 +67,9 @@
 
 \newpage
 \pagenumbering{gobble}
+{\hypersetup{linkcolor=black}
 \tableofcontents
+}
 \newpage
 \pagestyle{fancy}
 \fancyhf{}
@@ -91,7 +93,11 @@ The result of this work is the "Think Water" device, a personal hydration monito
 
 From a technical perspective, the project focused on several key challenges. Accurate sip detection was achieved using a multi-sensor approach combining a load cell, an inertial measurement unit, and a glass presence detection (with a hall sensor), ensuring reliability in real domestic conditions with any type of glass. A low-power architecture was implemented by splitting the system into two devices: a battery powered coaster optimized for autonomy and a base station responsible for computation, display, and feedback. Bluetooth Low Energy communication (BLE), local data storage, and a simple user interface were chosen to maximize usability and robustness, particularly for elderly users.\vspace{0.2cm}
 
-In terms of market positioning, the "Think Water" differentiates itself clearly from existing solutions. Unlike smart bottles or app-based hydration trackers, it does not impose a specific container, does not rely on digital literacy, and does not require habit changes. The key unique selling point of the product is its adaptability both in terms of hydration target customization and in the use of different glass types. The objective is computed for each user based on personal and environmental parameters rather than generic recommendations. This positioning, combined with a discreet and domestic-oriented design, creates a strong value proposition with limited direct competition. Intellectual property analysis further confirmed opportunities for differentiation and freedom to operate.\vspace{0.2cm}
+In terms of market positioning, the "Think Water" differentiates itself clearly from existing solutions. Unlike smart bottles or app-based hydration trackers, it does not impose a specific container, does not rely on digital literacy, and does not require habit changes. The key unique selling point of the product is its adaptability both in terms of hydration target customization and in the use of different glass types. The objective is computed for each user based on personal and environmental parameters rather than generic recommendations. This positioning, combined with a discreet and domestic-oriented design, creates a strong value proposition with limited direct competition.\vspace{0.2cm}
+
+From an intellectual property perspective, a detailed prior art and patent analysis highlighted both existing solutions and clear opportunities for differentiation. While several patents address hydration reminders or consumption tracking, none combine a detachable measurement unit attached to the glass with a fully local, two-device architecture and personalized hydration targets. Our approach avoids reliance on cloud services or mobile applications and introduces a novel separation of functions between a smart coaster and a physical base station. In addition, the personalization model used to compute hydration goals represents a strong differentiating element that can be protected as a trade secret, while the overall system architecture and attachment mechanism offer opportunities for patent protection. This analysis confirms both freedom to operate and a solid basis for a defensible IP strategy.\vspace{0.2cm}
+
+
 
 The prototype made demonstrates the core elements of the product concept: automatic sip detection, personalized hydration goals, local data storage, intuitive feedback, and senior-friendly interaction. While not yet a final product, it validates the technical feasibility and relevance of the concept. The project was carried out through a structured team effort, with clear task allocation between mechanical design, electronics, software development, and project management. Iterative prototyping, testing, and coordination allowed the team to overcome manufacturing delays and integration challenges.\vspace{0.2cm}
 
@@ -150,7 +156,7 @@ Thus we can see that elderly people are subject to a problem that can be life th
 
 \subsection{Unique selling points of the product}
 
-The following diagram summarizes the Unique Selling Points (USPs) of our product,
+The following diagram summarizes the Unique Selling Points (USP) of our product,
 highlighting what differentiates it from competitors and why it fits the users' needs.
 
 \begin{figure}[H]
@@ -159,7 +165,7 @@ highlighting what differentiates it from competitors and why it fits the users' 
   clip, width=0.85\textwidth]{logos/usp.png}
     \caption{Unique Selling Points (USP) analysis of the "Think Water"}
 \end{figure}
-A Lot of companies are doing hydration sensors and device that reminds people to drink. Mostly based on software and digital application, or all-in-one devices. Nevertheless, no companies is making product specifically for domestic use, meaning discrete, ergonomic and easy-to-use. Moreover, no companies have personalized targets for individuals, which is also a key feature of our product. 
+A lot of companies are doing hydration sensors and device that reminds people to drink. Mostly based on software and digital application, or all-in-one devices. Nevertheless, no companies is making product specifically for domestic use, meaning discrete, ergonomic and easy-to-use. Moreover, no companies have personalized targets for individuals, which is also a key feature of our product. 
 To be personalized it requires some easy pre-steps before starting but once it is done, it ensures freedom of use to the customer. The fact that our device is separated in 2 parts, allows us to make a smaller coaster, while keeping record of the water consumption and displaying it dynamically to the customer on the base station. Not only it reminds you to drink based on your specific needs, but it also ensures that you can use it easily and, importantly, with any glass you have at home. This strength is something unique that will motivate the customers to buy our product. Having a device that is made for domestic use but not invasive and adaptable will allow the customer to change its habit in a reasonable way. It is the key point of our product. We focused our efforts in making something discrete but yet precise, personalized and adapted to domestic use and to seniors. This novelty is what will attract customers and allow us to enter the market with confidence.
 \newpage
 
@@ -249,7 +255,7 @@ M5 & Sleep/awake mode control & \#15 & acceleration spike & $\frac{m}{s^2}$ & Sh
 M6 & Store all measurements & \#0, \#2, \#16 & Time of storage & h & Shall & 24 & 48 & -- \\ \hline
 
 \rowcolor{orange!10}
-M7 & Compute a daily theoretical consumption target& \#2 & Consumption volume & L & Should & 1.5 & -- & -- \\ \hline
+M7 & Compute a daily theoretical consumption target& \#2 & Consumption volume & L & Shall & 1.5 & -- & -- \\ \hline
 
 \rowcolor{orange!10}
 M8 & Store daily consumption data and theoretical daily target& \#2, \#16 & Time of storage & Years & Shall & 1 & 2 & -- \\ \hline
@@ -626,11 +632,11 @@ During drinking events (10 events/day $\times$ 14~s/event = 140~s/day):
 
 With an 820~mAh Li-ion battery: $820 / 91 = 9.0$ days theoretical. Accounting for battery aging and temperature effects, practical autonomy is 7 to 10 days, well suited for weekly charging.\vspace{0.2cm}
 
-Future optimizations could include further reduction of communication frequency, more aggressive duty-cycling of sensors, or the integration of wireless charging to improve ease of use.\vspace{0.2cm}
+Future optimizations could include further reduction of communication frequency, more aggressive duty-cycling of sensors and integration of wireless charging to improve ease of use.\vspace{0.2cm}
 
 \textbf{Attachment mechanism and mechanical integration (S1, S3)}\vspace{0.2cm}
 
-The attachment mechanism between the coaster and the glass was designed to ensure stability, ease of use, and compatibility with a wide range of glasses. It consists of five magnets inside the coaster that attract a steel plate, which is attached under the glass using 3M VHB RP45 double-sided acrylic foam tape, ensuring strong bonding and robustness.\vspace{0.2cm}
+The attachment mechanism between the coaster and the glass was designed to ensure stability, ease of use, and compatibility with a wide range of glasses. It consists of five magnets inside the coaster that attract a steel plate, which is attached under the glass using 3M VHB RP45 \cite{VHB} double-sided acrylic foam tape, ensuring strong bonding and robustness.\vspace{0.2cm}
 
 This solution was validated through repeated handling and lift tests but could be improve by implementing auto-centering by placing a magnet instead of a steal plate under the glass. However, it introduces a setup step for the user. Future optimizations could replace adhesive pads with a reusable attachment mechanism such as suction or mechanical clipping, reducing user constraints and simplifying installation.\vspace{0.2cm}
 
@@ -646,17 +652,31 @@ The combination of visual and audio stimuli increases reliability without increa
 \subsection{Manufacturing choices and proposals for future production}
 
 \subsubsection{Prototype fabrication}
+\textbf{Base station :}\vspace{0.2cm}
 
 To build the base prototype, 5 mm thick MDF sheets were used.
-We first created a 3D model of the base in CATIA (Figure \ref{fig:base+coaster} and \ref{fig:base}), which served as the basis for designing different 2D shapes, shown in Figure \ref{fig:dxf_base}. These shapes were then laser-cut from the MDF sheets and stacked to physically realize the prototype. This approach allowed us to easily stack the layers using wood glue in order to obtain the desired proportions. We chose this process because it is very simple and quick to implement, as someone from SPOT would say, “it’s like drawing” but in 3D. It makes it easy to visualize the final shape and to test different assemblies before gluing, in order to decide whether additional thicknesses are needed or should be removed. Since the base had to adapt to the coaster, this method offered a high degree of flexibility, which was essential. Moreover, MDF is easy to drill with a standard drill, which allowed us to add holes for the various components afterward, once placement tests had been carried out inside the enclosure.
+A 3D model of the base in CATIA was made (Fig. \ref{fig:base+coaster} and \ref{fig:base}), which served as the basis for designing different 2D shapes, shown in Figure \ref{fig:dxf_base}. These shapes were then laser-cut from the MDF sheets and stacked to physically realize the prototype. This approach allowed to easily stack the layers using wood glue in order to obtain the desired proportions. This process was chose because it is very simple and quick to implement, as someone from SPOT would say, “it’s like drawing” but in 3D. It makes it easy to visualize the final shape and to test different assemblies before gluing, in order to decide whether additional thicknesses are needed or should be removed. Since the base had to adapt to the coaster, this method offered a high degree of flexibility, which was essential. Moreover, MDF is easy to drill with a standard drill, which allowed to add holes for the various components afterward, once placement tests had been carried out inside the enclosure.\\\vspace{0.2cm}
 
+\noindent \textbf{Coaster :}\vspace{0.2cm}
 
-
+The prototyping process began with the creation of a schematic drawing to define the layout and positioning of the electronic components within the coaster. This preliminary step allowed the evaluation of spatial constraints and functional organization prior to detailed design. Once the components were received, their actual dimensions were measured and integrated into a CAD model (Fig. \ref{fig:coaster_dessus} and \ref{fig:coaster_dessous}). Particular attention was given to component tolerances and attachment systems during design phase. Based on this model, the coaster was manufactured using 3D printing. Three successive iterations were produced and tested in order to refine the component retention solutions, including a clip-fit mechanism and a mechanically constrained system using a screwed retaining bar combined with surrounding walls, with the latter being selected for the final design. Structural robustness was also optimized by reducing the side wall thickness to decrease overall weight while maintaining sufficient resistance to impacts. In addition, the ergonomics and usability of the product were improved by modifying the original circular geometry: two opposite sides were truncated to create flat reference surfaces, ensuring guided alignment and preventing incorrect positioning when the coaster is placed on the charging base. The process concluded with the assembly phase, during which the LEDs were soldered in place, the electronic components were integrated into the printed enclosure, and all electrical connections were completed.
 
 \subsubsection{Final product (estimated costs for manufacturing)}
 
 
+For an industrial version of our product, manufacturing would rely on standard large-scale production methods: custom PCB fabrication and assembly for the electronics, injection molding for the housings (even if the prototype of the base was in wood, this simplifies the manufacturing and lower the costs), and simplified manual assembly for the final integration (especially for the LED integration). The prototype's electronics components cost is estimated at 90 CHF, it's mainly due to low-volume purchasing, development boards, and non-optimized hardware (no specific PCB designed).\vspace{0.2cm}
+
+In an industrial context, these costs would be significantly reduced. By replacing development modules with a dedicated PCB, sourcing components in large volumes, and negotiating with suppliers, the electronic bill of materials could realistically drop to approximately 30 CHF per unit. Injection-molded plastic housings for the coaster and the base would cost around 4 CHF per unit. Manual assembly, wiring, testing, calibration, and quality control would add approximately 10 CHF, and packaging and logistics around 3 CHF.\vspace{0.2cm}
+
+Overall, this leads to an estimated manufacturing cost of roughly 47 CHF per unit at scale. While early production runs may operate with limited margins or slight losses, this cost structure makes a retail price of 50 CHF achievable in the short term. Profitability would then be reinforced through economies of scale and complementary revenue streams, such as optional subscription-based services for remote data access, ensuring the long-term sustainability of the product.
+\textcolor{red}{mettre ce paragraphe dans business plutot et liasser juste le prix de 47chf de production ici (pas parler de la strategie de business mtn)?}
+
 \subsubsection{Quality analysis and control}
+At the fabrication level, each unit would undergo a visual inspection to verify soldering quality, mechanical assembly, cable routing, and connector integrity. Critical components such as the battery, sensors, and communication modules would be checked individually before final assembly. A basic end-of-line functional test would confirm that the coaster and base station power on correctly, communicate properly, and provide visual and audio feedback as expected.\vspace{0.2cm}
+
+From a functional perspective, calibration procedures would be applied to ensure measurement accuracy. The load cell would be calibrated using reference weights, and verification tests would confirm correct detection of drinking events. Communication reliability, data storage, LED behavior, buzzer alerts, and charging functionality would also be systematically tested.\vspace{0.2cm}
+
+Finally, reliability and usage-oriented tests would be conducted to validate robustness in real-life conditions. These include drop tests, splash resistance checks, battery endurance testing over multiple charge cycles, and long-duration operation tests. User feedback sessions, especially involving elderly users, would help identify usability issues and ensure that the product remains intuitive and non-intrusive.\vspace{0.2cm}
 
 
 
@@ -670,7 +690,7 @@ We first created a 3D model of the base in CATIA (Figure \ref{fig:base+coaster} 
 
 A thorough search was conducted on patent databases like Espacenet and Lens.org, focusing on dehydration preventing devices. Upon reviewing existing patent, we found some product who are closely related to our own device.\vspace{0.2cm}
 
-First, there is an intelligent cup coaster (CN204467705U) \cite{IP1} that consists of a coaster with included screen and button that allows to switch between different users. It is used as a balance on which people can leave their glass and it will measure the weight and deduce the water consumption. This device is in some ways similar to our product. But it is not attachable to a glass. We also implement a screen and a knob but not on the coaster itself. We designed our product such that the coaster is first attachable to the glass and second, only displays visual stimuli. No user interface is included in the coaster itself. This is  a significant difference with our product, that is meant to be attached and transportable around the house.
+First, there is an intelligent cup coaster (CN204467705U) \cite{IP1} that consists of a coaster with included screen and button that allows to switch between different users. It is used as a scale on which people can leave their glass to measure the weight and deduce the water consumption. This device is in some ways similar to our product. But it is not attachable to a glass. We also implement a screen and a knob but not on the coaster itself. We designed our product such that the coaster is first attachable to the glass and second, only displays visual stimuli. No user interface is included in the coaster itself. This is  a significant difference with our product, which is meant to be attached and transported around the house.
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.5\linewidth]{IP1.png}
@@ -820,7 +840,7 @@ Since our product targets a wide range of people, we would like to make it avail
 
 
 \subsection{Your organization}
-ThinkWater is a company created by 5 talented individuals, each bringing a different yet complementary approach and exceptional dedication to the company.\vspace{0.2cm}
+"Think Water" is a company created by 5 talented individuals, each bringing a different yet complementary approach and exceptional dedication to the company.\vspace{0.2cm}
 
 Mostafa was the manager. He is the one making sure the product is presentable and that the communication with other is done smoothly while serving the company's interests. He was also our dedicated solder, making sure all electronic components are well assembled and connected together.\vspace{0.2cm}
 
@@ -967,7 +987,7 @@ From a managerial perspective, coordinating parallel tasks such as hardware deve
 
 \textbf{Eliot} - I mainly focused on the mechanical design of the base station. I spent a significant amount of time working between SKIL and SPOT to design, prototype, and improve the wooden base using CAD and laser cutting. This iterative process allowed me to refine the structure, ensure proper integration of the electronic components, and achieve a design that is both functional and aesthetically discreet for domestic use. Through multiple trials and adjustments, I contributed to making the base station robust, well-finished, and well integrated with the coaster.\vspace{0.2cm}
 
-\textbf{Martin} - I was primarily responsible for the mechanical design and optimization of the coaster usind CAD. I worked extensively at SPOT to prototype, redesign, and resize the coaster through three iterations, focusing on compactness, ergonomics, and ease of use. 3D printing was used for these iterations by testing different geometries and assembly solutions, I helped improve the reliability of the attachment mechanism and the overall robustness of the coaster. My work ensured that the coaster remained discreet, functional, and well adapted to everyday domestic use. I also reviewed different market strategies for the deployment of our product.\vspace{0.2cm}
+\textbf{Martin} - I was primarily responsible for the mechanical design and optimization of the coaster using CAD. I worked extensively at SPOT to prototype, redesign, and resize the coaster through three iterations, focusing on compactness, ergonomics, and fit of components. 3D printing was used for these iterations by testing different geometries and assembly solutions, I improve the reliability of the attachment mechanism and the overall robustness of the coaster. My work ensured that the coaster remained discreet, functional, and well adapted to everyday domestic use. I also reviewed different market strategies for the deployment of our product.\vspace{0.2cm}
 
 \textbf{Roméo} - I was in charge of the software and electronic aspects of the project. I developed the firmware architecture, implemented the core logic of the system, and designed a clean and intuitive user interface for the base station. I also ensured proper communication between the coaster and the base, pushing the code to be both efficient and reliable. In addition, I acted as a technical bridge within the team, helping others understand the components, their interactions, and guiding integration decisions throughout the project.
 
@@ -1112,12 +1132,14 @@ The CAD was made on CATIA then used in STL format to be used on PrusaSlicer to t
     \centering
     \includegraphics[width=1\textwidth]{Photos/vue_dessus.png}
     \caption{Top view of the coaster (CATIA Screenshot).}
+    \label{fig:coaster_dessus}
 \end{figure}
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=1\textwidth]{Photos/vue_dessous.png}
     \caption{Underneath view of the coaster (CATIA Screenshot).}
+    \label{fig:coaster_dessous}
 \end{figure}
 
 \textbf{Base :}\\
